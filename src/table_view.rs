@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -7,7 +6,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{ColumnInfo, Connection, IndexInfo, ResultSet, Value};
+use crate::db::{ColumnInfo, Connection, IndexInfo, ResultSet};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -17,6 +16,8 @@ const CELL_PADDING: i32 = 44;
 const MIN_COL_WIDTH: i32 = 80;
 /// Threshold a column width may not exceed; longer content ellipsizes.
 const MAX_COL_WIDTH: i32 = 420;
+/// Rows fetched per page (infinite scroll).
+const PAGE_SIZE: usize = 500;
 
 mod imp {
     use super::*;
@@ -64,6 +65,14 @@ mod imp {
         pub search_term: RefCell<String>,
         /// Pending debounced search timeout.
         pub search_source: RefCell<Option<glib::SourceId>>,
+        /// The live row store, kept so later pages can append.
+        pub store: RefCell<Option<gio::ListStore>>,
+        /// Rows fetched so far (the OFFSET for the next page).
+        pub offset: std::cell::Cell<usize>,
+        /// A page fetch is in flight.
+        pub loading: std::cell::Cell<bool>,
+        /// Last page was short — no more rows to fetch.
+        pub exhausted: std::cell::Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -89,8 +98,22 @@ mod imp {
             self.header_scroll
                 .set_hadjustment(Some(&self.grid_scroll.hadjustment()));
 
-            // Ctrl+F / typing opens the search bar; Esc closes it.
+            // Load the next page when scrolled near the bottom.
+            let vadj = self.grid_scroll.vadjustment();
             let obj = self.obj();
+            vadj.connect_value_changed(glib::clone!(
+                #[weak]
+                obj,
+                move |adj| {
+                    let near_bottom =
+                        adj.value() + adj.page_size() >= adj.upper() - adj.page_size().max(200.0);
+                    if near_bottom {
+                        obj.load_more();
+                    }
+                }
+            ));
+
+            // Ctrl+F / typing opens the search bar; Esc closes it.
             self.search_bar.set_key_capture_widget(Some(&*obj));
 
             // Closing the search bar clears the query and reloads all rows.
@@ -155,18 +178,22 @@ impl TableView {
         }
     }
 
+    /// Full (re)load from the first page: refetch metadata + first page.
     fn load(&self) {
+        let imp = self.imp();
+        if imp.loading.get() {
+            return;
+        }
+        imp.loading.set(true);
+        imp.offset.set(0);
+        imp.exhausted.set(false);
+
         let schema = self.schema();
         let table = self.table();
-        let term = self.imp().search_term.borrow().clone();
-        let names: Vec<String> = self
-            .imp()
-            .columns
-            .borrow()
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        let sql = build_query(&schema, &table, &term, &names);
+        let term = imp.search_term.borrow().clone();
+        let names: Vec<String> = imp.columns.borrow().iter().map(|c| c.name.clone()).collect();
+        let order = self.order_target();
+        let sql = build_query(&schema, &table, &term, &names, order.as_ref(), PAGE_SIZE, 0);
         let conn = self.conn();
         let (sc, tb) = (schema.clone(), table.clone());
         let rx = runtime::spawn(async move {
@@ -178,15 +205,18 @@ impl TableView {
 
         let this = self.clone();
         glib::spawn_future_local(async move {
+            let imp = this.imp();
+            imp.loading.set(false);
             match rx.recv().await {
                 Ok(Ok((columns, indexes, result))) => {
-                    let imp = this.imp();
-                    imp.sort.replace(None);
+                    let n = result.rows.len();
                     imp.columns.replace(columns);
                     imp.result.replace(Some(result));
                     this.render();
                     this.build_structure();
                     this.build_indexes(indexes);
+                    imp.offset.set(n);
+                    imp.exhausted.set(n < PAGE_SIZE);
                 }
                 Ok(Err(e)) => this.imp().summary.set_text(&e.to_string()),
                 Err(_) => {}
@@ -194,23 +224,88 @@ impl TableView {
         });
     }
 
-    /// Rebuild the custom header, the columns, and the row store from the
-    /// stored result, honoring the current sort.
+    /// Fetch the next page and append it to the store (infinite scroll).
+    fn load_more(&self) {
+        let imp = self.imp();
+        if imp.loading.get() || imp.exhausted.get() || imp.store.borrow().is_none() {
+            return;
+        }
+        imp.loading.set(true);
+
+        let schema = self.schema();
+        let table = self.table();
+        let term = imp.search_term.borrow().clone();
+        let names: Vec<String> = imp.columns.borrow().iter().map(|c| c.name.clone()).collect();
+        let order = self.order_target();
+        let offset = imp.offset.get();
+        let sql = build_query(&schema, &table, &term, &names, order.as_ref(), PAGE_SIZE, offset);
+        let conn = self.conn();
+        let rx = runtime::spawn(async move { conn.query(&sql).await });
+
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let imp = this.imp();
+            imp.loading.set(false);
+            match rx.recv().await {
+                Ok(Ok(result)) => {
+                    let n = result.rows.len();
+                    if let Some(store) = imp.store.borrow().as_ref() {
+                        for row in &result.rows {
+                            store.append(&RowObject::new(Rc::new(row.values.clone())));
+                        }
+                    }
+                    imp.offset.set(offset + n);
+                    imp.exhausted.set(n < PAGE_SIZE);
+                    this.update_summary();
+                }
+                Ok(Err(e)) => this.imp().summary.set_text(&e.to_string()),
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// The column the grid is ordered by: the active sort, else the primary key
+    /// (for stable pagination), else none.
+    fn order_target(&self) -> Option<(String, bool)> {
+        let imp = self.imp();
+        if let Some((idx, asc)) = *imp.sort.borrow() {
+            if let Some(result) = imp.result.borrow().as_ref() {
+                if let Some(col) = result.columns.get(idx) {
+                    return Some((col.name.clone(), asc));
+                }
+            }
+        }
+        imp.columns
+            .borrow()
+            .iter()
+            .find(|c| c.is_primary_key)
+            .map(|c| (c.name.clone(), true))
+    }
+
+    fn update_summary(&self) {
+        let imp = self.imp();
+        let shown = imp.store.borrow().as_ref().map_or(0, |s| s.n_items());
+        if imp.search_term.borrow().trim().is_empty() {
+            imp.summary.set_text(&format!(
+                "{} rows · showing {shown}",
+                group_thousands(self.estimated_rows())
+            ));
+        } else {
+            imp.summary
+                .set_text(&format!("{shown} matching row{}", if shown == 1 { "" } else { "s" }));
+        }
+    }
+
+    /// Rebuild the custom header + columns and seed the store with the first
+    /// page. Ordering is done server-side (see `order_target`).
     fn render(&self) {
         let imp = self.imp();
         let guard = imp.result.borrow();
         let Some(result) = guard.as_ref() else { return };
 
-        // Order the rows per the active sort.
-        let mut rows: Vec<&crate::db::Row> = result.rows.iter().collect();
-        if let Some((idx, asc)) = *imp.sort.borrow() {
-            rows.sort_by(|a, b| {
-                let o = cmp_values(a.values.get(idx), b.values.get(idx));
-                if asc { o } else { o.reverse() }
-            });
-        }
+        let rows: Vec<&crate::db::Row> = result.rows.iter().collect();
 
-        // Sample widths from a slice of the (unsorted) rows.
+        // Sample widths from a slice of the rows.
         let sample = &result.rows[..result.rows.len().min(60)];
 
         // Measure real text widths with Pango so columns fit their content,
@@ -280,23 +375,15 @@ impl TableView {
             header.set_visible(false);
         }
 
-        // Fill the store.
+        // Seed the store with the first page; later pages append to it.
         let store = gio::ListStore::new::<RowObject>();
         for row in rows {
             store.append(&RowObject::new(Rc::new(row.values.clone())));
         }
-        cv.set_model(Some(&gtk::NoSelection::new(Some(store))));
-
-        let shown = result.rows.len();
-        if imp.search_term.borrow().trim().is_empty() {
-            imp.summary.set_text(&format!(
-                "{} rows · showing {shown}",
-                group_thousands(self.estimated_rows())
-            ));
-        } else {
-            imp.summary
-                .set_text(&format!("{shown} matching row{}", if shown == 1 { "" } else { "s" }));
-        }
+        cv.set_model(Some(&gtk::NoSelection::new(Some(store.clone()))));
+        drop(guard);
+        imp.store.replace(Some(store));
+        self.update_summary();
     }
 
     /// Populate the Structure tab from column metadata.
@@ -459,7 +546,8 @@ impl TableView {
             _ => Some((idx, true)),
         };
         self.imp().sort.replace(next);
-        self.render();
+        // Re-fetch from the first page with the new ORDER BY.
+        self.load();
     }
 
     #[template_callback]
@@ -599,56 +687,56 @@ fn badge_color(value: &str) -> &'static str {
     }
 }
 
-fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
-    use Value::*;
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, _) => Ordering::Greater,
-        (_, None) => Ordering::Less,
-        (Some(a), Some(b)) => match (a, b) {
-            (Null, Null) => Ordering::Equal,
-            (Null, _) => Ordering::Greater,
-            (_, Null) => Ordering::Less,
-            (Int(x), Int(y)) => x.cmp(y),
-            (Float(x), Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Int(x), Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
-            (Bool(x), Bool(y)) => x.cmp(y),
-            _ => a.to_string().cmp(&b.to_string()),
-        },
-    }
-}
-
 /// Double any embedded quotes so an identifier is safe inside `"..."`.
 fn quote_ident(ident: &str) -> String {
     ident.replace('"', "\"\"")
 }
 
-/// Build the SELECT, adding a case-insensitive WHERE across all columns
-/// (cast to text) when a search term is present. The term is escaped for both
-/// the SQL string literal and LIKE metacharacters.
-fn build_query(schema: &str, table: &str, term: &str, columns: &[String]) -> String {
-    let base = format!(
+/// Build the paged SELECT. Adds a case-insensitive WHERE across all columns
+/// (cast to text) when a search term is present, an optional ORDER BY, and
+/// LIMIT/OFFSET. The term is escaped for both the SQL string literal and LIKE
+/// metacharacters; identifiers are quoted.
+fn build_query(
+    schema: &str,
+    table: &str,
+    term: &str,
+    columns: &[String],
+    order: Option<&(String, bool)>,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let mut sql = format!(
         "SELECT * FROM \"{}\".\"{}\"",
         quote_ident(schema),
         quote_ident(table)
     );
+
     let term = term.trim();
-    if term.is_empty() || columns.is_empty() {
-        return format!("{base} LIMIT 1000");
+    if !term.is_empty() && !columns.is_empty() {
+        let pattern = escape_like(term).replace('\'', "''");
+        let conds: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "CAST(\"{}\" AS text) ILIKE '%{}%' ESCAPE '\\'",
+                    quote_ident(c),
+                    pattern
+                )
+            })
+            .collect();
+        sql.push_str(&format!(" WHERE {}", conds.join(" OR ")));
     }
-    let pattern = escape_like(term).replace('\'', "''");
-    let conds: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            format!(
-                "CAST(\"{}\" AS text) ILIKE '%{}%' ESCAPE '\\'",
-                quote_ident(c),
-                pattern
-            )
-        })
-        .collect();
-    format!("{base} WHERE {} LIMIT 1000", conds.join(" OR "))
+
+    if let Some((col, asc)) = order {
+        sql.push_str(&format!(
+            " ORDER BY \"{}\" {}",
+            quote_ident(col),
+            if *asc { "ASC" } else { "DESC" }
+        ));
+    }
+
+    sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+    sql
 }
 
 /// Escape LIKE metacharacters so the term matches literally.
@@ -670,24 +758,29 @@ mod tests {
     #[test]
     fn plain_when_no_term() {
         assert_eq!(
-            build_query("public", "orders", "", &["id".to_string()]),
-            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
+            build_query("public", "orders", "", &["id".to_string()], None, 500, 0),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 500 OFFSET 0"
         );
     }
 
     #[test]
     fn escapes_quotes_and_like_metachars() {
-        let q = build_query("public", "t", "a'b%c", &["x".to_string()]);
-        assert!(
-            q.contains(r"ILIKE '%a''b\%c%' ESCAPE '\'"),
-            "got: {q}"
-        );
+        let q = build_query("public", "t", "a'b%c", &["x".to_string()], None, 500, 0);
+        assert!(q.contains(r"ILIKE '%a''b\%c%' ESCAPE '\'"), "got: {q}");
     }
 
     #[test]
     fn ors_all_columns() {
-        let q = build_query("s", "t", "z", &["a".to_string(), "b".to_string()]);
+        let q = build_query("s", "t", "z", &["a".to_string(), "b".to_string()], None, 500, 0);
         assert!(q.contains("\"a\"") && q.contains("\"b\"") && q.contains(" OR "));
+    }
+
+    #[test]
+    fn order_and_offset() {
+        let order = ("id".to_string(), false);
+        let q = build_query("s", "t", "", &[], Some(&order), 500, 1000);
+        assert!(q.contains("ORDER BY \"id\" DESC"), "got: {q}");
+        assert!(q.ends_with("LIMIT 500 OFFSET 1000"), "got: {q}");
     }
 }
 

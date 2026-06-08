@@ -112,5 +112,20 @@ async fn run() {
     assert_eq!(pk.method, "btree");
     assert!(pk.columns.contains("id"));
 
+    // Pagination: ORDER BY + LIMIT/OFFSET returns disjoint, contiguous pages.
+    let page1 = conn
+        .query("SELECT id FROM \"public\".\"orders\" ORDER BY \"id\" ASC LIMIT 500 OFFSET 0")
+        .await
+        .expect("page 1");
+    let page2 = conn
+        .query("SELECT id FROM \"public\".\"orders\" ORDER BY \"id\" ASC LIMIT 500 OFFSET 500")
+        .await
+        .expect("page 2");
+    assert_eq!(page1.rows.len(), 500, "full first page");
+    assert!(!page2.rows.is_empty(), "second page has rows");
+    let last_p1 = page1.rows.last().unwrap().values[0].to_string();
+    let first_p2 = page2.rows.first().unwrap().values[0].to_string();
+    assert_ne!(last_p1, first_p2, "pages do not overlap");
+
     conn.close().await.expect("close");
 }
