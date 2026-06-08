@@ -1,0 +1,15 @@
+[package]
+name = "sqweel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
+async-channel = "2.5.0"
+async-trait = "0.1.89"
+gtk = { version = "0.11.3", package = "gtk4" }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+
+[build-dependencies]
+glib-build-tools = "0.22.0"

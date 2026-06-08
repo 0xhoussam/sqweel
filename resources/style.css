@@ -1,0 +1,8 @@
+.app-icon {
+  color: @accent_color;
+  background-color: alpha(@accent_color, 0.15);
+  border-radius: 9999px;
+  min-width: 64px;
+  min-height: 64px;
+  padding: 16px;
+}

@@ -1,0 +1,154 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $SqweelWindow: Adw.ApplicationWindow {
+  title: "sqweel";
+  default-width: 480;
+  default-height: 760;
+
+  content: Adw.ToolbarView {
+    [top]
+    Adw.HeaderBar {
+      title-widget: Adw.WindowTitle {
+        title: "";
+      };
+
+      [end]
+      Gtk.MenuButton {
+        icon-name: "open-menu-symbolic";
+        primary: true;
+        tooltip-text: "Main Menu";
+        menu-model: primary_menu;
+      }
+    }
+
+    content: Adw.ToastOverlay toast_overlay {
+      Gtk.ScrolledWindow {
+        hscrollbar-policy: never;
+
+        Adw.Clamp {
+          maximum-size: 400;
+          margin-top: 24;
+          margin-bottom: 24;
+          margin-start: 12;
+          margin-end: 12;
+
+          Gtk.Box {
+            orientation: vertical;
+            spacing: 18;
+
+            Gtk.Image {
+              styles ["app-icon"]
+              icon-name: "drive-harddisk-symbolic";
+              pixel-size: 32;
+              halign: center;
+              margin-bottom: 4;
+            }
+
+            Gtk.Label {
+              styles ["title-1"]
+              label: "Connect to a database";
+              halign: center;
+            }
+
+            Gtk.Label {
+              styles ["body", "dim-label"]
+              label: "sqweel browses your tables, runs queries, and keeps your saved connections in one place.";
+              wrap: true;
+              justify: center;
+              halign: center;
+              margin-bottom: 6;
+            }
+
+            Adw.PreferencesGroup {
+              Adw.ComboRow type_row {
+                title: "Type";
+
+                [prefix]
+                Gtk.Image {
+                  icon-name: "drive-harddisk-symbolic";
+                }
+
+                model: Gtk.StringList {
+                  strings ["PostgreSQL"]
+                };
+              }
+
+              Adw.EntryRow host_row {
+                title: "Host";
+              }
+
+              Adw.EntryRow port_row {
+                title: "Port";
+                input-purpose: digits;
+              }
+
+              Adw.EntryRow database_row {
+                title: "Database";
+              }
+
+              Adw.EntryRow username_row {
+                title: "Username";
+              }
+
+              Adw.PasswordEntryRow password_row {
+                title: "Password";
+              }
+            }
+
+            Adw.PreferencesGroup {
+              Adw.SwitchRow ssl_row {
+                title: "Use SSL/TLS";
+                active: true;
+
+                [prefix]
+                Gtk.Image {
+                  icon-name: "security-high-symbolic";
+                }
+              }
+
+              Adw.SwitchRow save_row {
+                title: "Save connection";
+                active: true;
+
+                [prefix]
+                Gtk.Image {
+                  icon-name: "user-bookmarks-symbolic";
+                }
+              }
+            }
+
+            Gtk.Button connect_button {
+              styles ["suggested-action", "pill"]
+              clicked => $on_connect_clicked();
+
+              Adw.ButtonContent {
+                icon-name: "network-transmit-receive-symbolic";
+                label: "Connect";
+              }
+            }
+
+            Gtk.Button test_button {
+              styles ["pill"]
+              clicked => $on_test_clicked();
+
+              Adw.ButtonContent {
+                icon-name: "emblem-synchronizing-symbolic";
+                label: "Test connection";
+              }
+            }
+          }
+        }
+      }
+    };
+  };
+}
+
+menu primary_menu {
+  section {
+    item {
+      label: "About sqweel";
+      action: "app.about";
+    }
+  }
+}
