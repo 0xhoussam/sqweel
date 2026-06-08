@@ -319,6 +319,13 @@ impl MainView {
     }
 
     #[template_callback]
+    fn on_search_clicked(&self) {
+        if let Some(tv) = self.active_table() {
+            tv.toggle_search();
+        }
+    }
+
+    #[template_callback]
     fn on_add_tab(&self) {
         // Re-open the currently selected sidebar relation (no-op if already open).
         if let Some(row) = self.imp().relation_list.selected_row() {

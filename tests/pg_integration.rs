@@ -86,5 +86,18 @@ async fn run() {
     assert!(cust.is_foreign_key, "customer_id is FK");
     assert_eq!(cust.references.as_deref(), Some("customers.id"));
 
+    // Server-side search semantics: CAST(col AS text) ILIKE across types.
+    let hits = conn
+        .query("SELECT * FROM \"public\".\"orders\" WHERE CAST(\"status\" AS text) ILIKE '%paid%' LIMIT 1000")
+        .await
+        .expect("search by enum");
+    assert!(!hits.rows.is_empty(), "found paid orders");
+
+    let by_id = conn
+        .query("SELECT * FROM \"public\".\"orders\" WHERE CAST(\"id\" AS text) ILIKE '%20416%' LIMIT 1000")
+        .await
+        .expect("search by id");
+    assert_eq!(by_id.rows.len(), 1, "exact id match via text cast");
+
     conn.close().await.expect("close");
 }

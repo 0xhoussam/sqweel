@@ -44,6 +44,10 @@ mod imp {
         pub summary: TemplateChild<gtk::Label>,
         #[template_child]
         pub structure_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
+        pub search_bar: TemplateChild<gtk::SearchBar>,
+        #[template_child]
+        pub search_entry: TemplateChild<gtk::SearchEntry>,
 
         pub conn: RefCell<Option<Arc<dyn Connection>>>,
         pub schema: RefCell<String>,
@@ -54,6 +58,9 @@ mod imp {
         pub structure_rows: RefCell<Vec<adw::ActionRow>>,
         /// (column index, ascending) of the active client-side sort.
         pub sort: RefCell<Option<(usize, bool)>>,
+        pub search_term: RefCell<String>,
+        /// Pending debounced search timeout.
+        pub search_source: RefCell<Option<glib::SourceId>>,
     }
 
     #[glib::object_subclass]
@@ -78,6 +85,21 @@ mod imp {
             // Scroll the header strip horizontally in lockstep with the grid.
             self.header_scroll
                 .set_hadjustment(Some(&self.grid_scroll.hadjustment()));
+
+            // Ctrl+F / typing opens the search bar; Esc closes it.
+            let obj = self.obj();
+            self.search_bar.set_key_capture_widget(Some(&*obj));
+
+            // Closing the search bar clears the query and reloads all rows.
+            self.search_bar.connect_search_mode_enabled_notify(glib::clone!(
+                #[weak]
+                obj,
+                move |bar| {
+                    if !bar.is_search_mode() && !obj.imp().search_term.borrow().is_empty() {
+                        obj.imp().search_entry.set_text("");
+                    }
+                }
+            ));
         }
     }
     impl WidgetImpl for TableView {}
@@ -121,14 +143,27 @@ impl TableView {
         self.load();
     }
 
+    pub fn toggle_search(&self) {
+        let bar = &self.imp().search_bar;
+        let on = !bar.is_search_mode();
+        bar.set_search_mode(on);
+        if on {
+            self.imp().search_entry.grab_focus();
+        }
+    }
+
     fn load(&self) {
         let schema = self.schema();
         let table = self.table();
-        let sql = format!(
-            "SELECT * FROM \"{}\".\"{}\" LIMIT 1000",
-            quote_ident(&schema),
-            quote_ident(&table)
-        );
+        let term = self.imp().search_term.borrow().clone();
+        let names: Vec<String> = self
+            .imp()
+            .columns
+            .borrow()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let sql = build_query(&schema, &table, &term, &names);
         let conn = self.conn();
         let (sc, tb) = (schema.clone(), table.clone());
         let rx = runtime::spawn(async move {
@@ -248,10 +283,15 @@ impl TableView {
         cv.set_model(Some(&gtk::NoSelection::new(Some(store))));
 
         let shown = result.rows.len();
-        imp.summary.set_text(&format!(
-            "{} rows · showing {shown}",
-            group_thousands(self.estimated_rows())
-        ));
+        if imp.search_term.borrow().trim().is_empty() {
+            imp.summary.set_text(&format!(
+                "{} rows · showing {shown}",
+                group_thousands(self.estimated_rows())
+            ));
+        } else {
+            imp.summary
+                .set_text(&format!("{shown} matching row{}", if shown == 1 { "" } else { "s" }));
+        }
     }
 
     /// Populate the Structure tab from column metadata.
@@ -381,6 +421,23 @@ impl TableView {
     fn on_reload_clicked(&self) {
         self.reload();
     }
+
+    #[template_callback]
+    fn on_search_changed(&self) {
+        let term = self.imp().search_entry.text().to_string();
+        self.imp().search_term.replace(term);
+
+        // Debounce server round-trips while typing.
+        if let Some(id) = self.imp().search_source.take() {
+            id.remove();
+        }
+        let this = self.clone();
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            this.imp().search_source.take();
+            this.reload();
+        });
+        self.imp().search_source.replace(Some(id));
+    }
 }
 
 fn number_column(width: i32) -> gtk::ColumnViewColumn {
@@ -507,6 +564,73 @@ fn cmp_values(a: Option<&Value>, b: Option<&Value>) -> Ordering {
 /// Double any embedded quotes so an identifier is safe inside `"..."`.
 fn quote_ident(ident: &str) -> String {
     ident.replace('"', "\"\"")
+}
+
+/// Build the SELECT, adding a case-insensitive WHERE across all columns
+/// (cast to text) when a search term is present. The term is escaped for both
+/// the SQL string literal and LIKE metacharacters.
+fn build_query(schema: &str, table: &str, term: &str, columns: &[String]) -> String {
+    let base = format!(
+        "SELECT * FROM \"{}\".\"{}\"",
+        quote_ident(schema),
+        quote_ident(table)
+    );
+    let term = term.trim();
+    if term.is_empty() || columns.is_empty() {
+        return format!("{base} LIMIT 1000");
+    }
+    let pattern = escape_like(term).replace('\'', "''");
+    let conds: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            format!(
+                "CAST(\"{}\" AS text) ILIKE '%{}%' ESCAPE '\\'",
+                quote_ident(c),
+                pattern
+            )
+        })
+        .collect();
+    format!("{base} WHERE {} LIMIT 1000", conds.join(" OR "))
+}
+
+/// Escape LIKE metacharacters so the term matches literally.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_query;
+
+    #[test]
+    fn plain_when_no_term() {
+        assert_eq!(
+            build_query("public", "orders", "", &["id".to_string()]),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 1000"
+        );
+    }
+
+    #[test]
+    fn escapes_quotes_and_like_metachars() {
+        let q = build_query("public", "t", "a'b%c", &["x".to_string()]);
+        assert!(
+            q.contains(r"ILIKE '%a''b\%c%' ESCAPE '\'"),
+            "got: {q}"
+        );
+    }
+
+    #[test]
+    fn ors_all_columns() {
+        let q = build_query("s", "t", "z", &["a".to_string(), "b".to_string()]);
+        assert!(q.contains("\"a\"") && q.contains("\"b\"") && q.contains(" OR "));
+    }
 }
 
 fn is_numeric(data_type: &str) -> bool {

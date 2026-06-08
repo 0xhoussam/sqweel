@@ -79,6 +79,15 @@ template $TableView: Gtk.Box {
     }
   }
 
+  Gtk.SearchBar search_bar {
+    Gtk.SearchEntry search_entry {
+      placeholder-text: "Search rows (server-side)…";
+      hexpand: true;
+      width-request: 320;
+      search-changed => $on_search_changed() swapped;
+    }
+  }
+
   Gtk.Stack view_stack {
     vexpand: true;
 

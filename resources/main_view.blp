@@ -116,8 +116,9 @@ template $MainView: Adw.NavigationPage {
           [end]
           Gtk.Button {
             icon-name: "system-search-symbolic";
-            tooltip-text: "Search";
+            tooltip-text: "Search rows";
             styles ["flat"]
+            clicked => $on_search_clicked() swapped;
           }
 
           [end]
