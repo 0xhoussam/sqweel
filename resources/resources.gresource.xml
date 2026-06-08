@@ -2,6 +2,7 @@
 <gresources>
   <gresource prefix="/com/marwa/sqweel/">
     <file preprocess="xml-stripblanks">window.ui</file>
+    <file preprocess="xml-stripblanks">main_view.ui</file>
     <file>style.css</file>
   </gresource>
 </gresources>

@@ -41,6 +41,23 @@ impl fmt::Display for Value {
 #[derive(Clone, Debug)]
 pub struct Column {
     pub name: String,
+    /// Driver type name for the header subtext (e.g. "int8", "timestamptz").
+    pub data_type: String,
+}
+
+/// A schema-level relation shown in the sidebar.
+#[derive(Clone, Debug)]
+pub struct Relation {
+    pub name: String,
+    pub kind: RelationKind,
+    /// Fast row-count estimate (Postgres `pg_class.reltuples`); approximate.
+    pub estimated_rows: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationKind {
+    Table,
+    View,
 }
 
 #[derive(Clone, Debug)]

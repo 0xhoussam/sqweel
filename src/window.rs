@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{self, ConnectionConfig};
+use crate::db::{self, Connection, ConnectionConfig};
+use crate::main_view::MainView;
 
 mod imp {
     use super::*;
@@ -11,6 +14,8 @@ mod imp {
     #[derive(Debug, Default, gtk::CompositeTemplate)]
     #[template(resource = "/com/marwa/sqweel/window.ui")]
     pub struct SqweelWindow {
+        #[template_child]
+        pub nav: TemplateChild<adw::NavigationView>,
         #[template_child]
         pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         #[template_child]
@@ -139,14 +144,19 @@ impl SqweelWindow {
         };
 
         self.set_busy(true);
-        let rx = crate::runtime::spawn(async move { driver.connect(&cfg).await.map(|_| ()) });
+        let cfg_for_view = cfg.clone();
+        let rx = crate::runtime::spawn(async move { driver.connect(&cfg).await });
 
         let this = self.clone();
         glib::spawn_future_local(async move {
             let result = rx.recv().await;
             this.set_busy(false);
             match result {
-                Ok(Ok(())) => this.toast("Connected"),
+                Ok(Ok(conn)) => {
+                    let conn: Arc<dyn Connection> = Arc::from(conn);
+                    let page = MainView::new(conn, &cfg_for_view);
+                    this.imp().nav.push(&page);
+                }
                 Ok(Err(e)) => this.toast(&e.to_string()),
                 Err(_) => this.toast("Connection task was dropped"),
             }

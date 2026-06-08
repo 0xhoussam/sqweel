@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
-use sqlx::{AssertSqlSafe, Column as _, Row as _};
+use sqlx::{AssertSqlSafe, Column as _, Row as _, TypeInfo as _};
 
-use super::{Column, Connection, ConnectionConfig, DbError, Driver, ResultSet, Row, Value};
+use super::{
+    Column, Connection, ConnectionConfig, DbError, Driver, Relation, RelationKind, ResultSet, Row,
+    Value,
+};
 
 fn conn_err(e: sqlx::Error) -> DbError {
     DbError::Connection(e.to_string())
@@ -96,6 +99,7 @@ impl Connection for PgConnection {
                     .iter()
                     .map(|c| Column {
                         name: c.name().to_string(),
+                        data_type: c.type_info().name().to_lowercase(),
                     })
                     .collect()
             })
@@ -114,6 +118,65 @@ impl Connection for PgConnection {
     async fn close(&self) -> Result<(), DbError> {
         self.pool.close().await;
         Ok(())
+    }
+
+    async fn server_version(&self) -> Result<String, DbError> {
+        let mut conn = self.pool.acquire().await.map_err(conn_err)?;
+        let row = sqlx::query("SHOW server_version")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(query_err)?;
+        let raw: String = row.try_get(0).map_err(query_err)?;
+        // server_version looks like "16.2 (Debian ...)"; keep the number.
+        Ok(raw.split_whitespace().next().unwrap_or(&raw).to_string())
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, DbError> {
+        let mut conn = self.pool.acquire().await.map_err(conn_err)?;
+        let rows = sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT LIKE 'pg_%' AND schema_name <> 'information_schema' \
+             ORDER BY schema_name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+        rows.iter()
+            .map(|r| r.try_get::<String, _>(0).map_err(query_err))
+            .collect()
+    }
+
+    async fn relations(&self, schema: &str) -> Result<Vec<Relation>, DbError> {
+        let mut conn = self.pool.acquire().await.map_err(conn_err)?;
+        // relkind: r=table, p=partitioned table, v=view, m=materialized view.
+        let rows = sqlx::query(
+            "SELECT c.relname, c.relkind::text, c.reltuples::bigint \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') \
+             ORDER BY c.relname",
+        )
+        .bind(schema)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let name: String = r.try_get(0).unwrap_or_default();
+                let relkind: String = r.try_get(1).unwrap_or_default();
+                let est: i64 = r.try_get(2).unwrap_or(0);
+                let kind = match relkind.as_str() {
+                    "v" | "m" => RelationKind::View,
+                    _ => RelationKind::Table,
+                };
+                Relation {
+                    name,
+                    kind,
+                    estimated_rows: est.max(0),
+                }
+            })
+            .collect())
     }
 }
 

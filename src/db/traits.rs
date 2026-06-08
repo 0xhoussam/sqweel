@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::{ConnectionConfig, DbError, ResultSet};
+use super::{ConnectionConfig, DbError, Relation, ResultSet};
 
 /// A database backend. One implementor per supported database (Postgres today).
 /// Adding a new database = implement this + `Connection`, register in `registry`.
@@ -36,4 +36,15 @@ pub trait Connection: Send + Sync {
     async fn query(&self, sql: &str) -> Result<ResultSet, DbError>;
     /// Close the connection / drain the pool.
     async fn close(&self) -> Result<(), DbError>;
+
+    // --- Introspection (sidebar / status bar) -------------------------------
+    // Kept on `Connection` for now; will split into a dedicated `Introspect`
+    // trait once it grows (columns, indexes, constraints, foreign keys).
+
+    /// Human-readable server version, e.g. "16.2".
+    async fn server_version(&self) -> Result<String, DbError>;
+    /// User-visible schemas (excludes system schemas).
+    async fn schemas(&self) -> Result<Vec<String>, DbError>;
+    /// Tables and views in a schema, with fast row-count estimates.
+    async fn relations(&self, schema: &str) -> Result<Vec<Relation>, DbError>;
 }

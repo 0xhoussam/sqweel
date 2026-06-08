@@ -6,3 +6,17 @@
   min-height: 64px;
   padding: 16px;
 }
+
+.status-bar {
+  border-top: 1px solid @borders;
+  min-height: 24px;
+}
+
+.data-table {
+  font-feature-settings: "tnum" 1;
+}
+
+.caption-heading {
+  font-size: 0.8em;
+  font-weight: bold;
+}

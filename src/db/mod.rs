@@ -13,4 +13,6 @@ pub mod postgres;
 pub use error::DbError;
 pub use registry::{driver, drivers};
 pub use traits::{Connection, Driver};
-pub use types::{Column, ConnectionConfig, ResultSet, Row, Value};
+pub use types::{
+    Column, ConnectionConfig, Relation, RelationKind, ResultSet, Row, Value,
+};

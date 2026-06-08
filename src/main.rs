@@ -1,11 +1,7 @@
-mod db;
-mod runtime;
-mod window;
-
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use window::SqweelWindow;
+use sqweel::window::SqweelWindow;
 
 const APP_ID: &str = "com.marwa.sqweel";
 

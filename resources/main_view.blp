@@ -1,0 +1,163 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $MainView: Adw.NavigationPage {
+  title: "Database";
+
+  child: Adw.NavigationSplitView {
+    min-sidebar-width: 240;
+    max-sidebar-width: 320;
+
+    sidebar: Adw.NavigationPage {
+      title: "Database";
+
+      child: Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          show-title: false;
+
+          title-widget: Gtk.Box {
+            orientation: horizontal;
+            spacing: 8;
+
+            Gtk.Image {
+              icon-name: "media-playback-start-symbolic";
+              styles ["success"]
+              pixel-size: 10;
+            }
+
+            Gtk.Box {
+              orientation: vertical;
+              valign: center;
+
+              Gtk.Label connection_name {
+                styles ["heading"]
+                label: "Database";
+                halign: start;
+              }
+
+              Gtk.Label connection_host {
+                styles ["caption", "dim-label"]
+                label: "";
+                halign: start;
+              }
+            }
+          };
+        }
+
+        content: Gtk.Box {
+          orientation: vertical;
+          spacing: 8;
+          margin-start: 8;
+          margin-end: 8;
+          margin-top: 8;
+          margin-bottom: 8;
+
+          Gtk.DropDown schema_dropdown {
+            tooltip-text: "Schema";
+          }
+
+          Gtk.SearchEntry search_entry {
+            placeholder-text: "Search tables";
+          }
+
+          Gtk.ScrolledWindow {
+            vexpand: true;
+            hscrollbar-policy: never;
+
+            Gtk.ListBox relation_list {
+              styles ["navigation-sidebar"]
+              selection-mode: single;
+            }
+          }
+        };
+      };
+    };
+
+    content: Adw.NavigationPage {
+      title: "Table";
+
+      child: Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          show-title: false;
+
+          title-widget: Gtk.Box {
+            orientation: horizontal;
+            spacing: 6;
+
+            Gtk.Image {
+              icon-name: "view-list-symbolic";
+              styles ["dim-label"]
+            }
+
+            Gtk.Label breadcrumb {
+              label: "—";
+              ellipsize: end;
+            }
+          };
+
+          [end]
+          Gtk.Button {
+            icon-name: "view-refresh-symbolic";
+            tooltip-text: "Reload";
+            clicked => $on_reload_clicked() swapped;
+          }
+        }
+
+        [top]
+        Gtk.Box {
+          styles ["toolbar"]
+          orientation: horizontal;
+          spacing: 6;
+          margin-start: 8;
+          margin-end: 8;
+          margin-top: 4;
+          margin-bottom: 4;
+
+          Gtk.Label row_summary {
+            styles ["dim-label", "caption"]
+            label: "";
+            hexpand: true;
+            halign: end;
+          }
+        }
+
+        content: Gtk.ScrolledWindow {
+          vexpand: true;
+          hexpand: true;
+
+          Gtk.ColumnView column_view {
+            styles ["data-table"]
+            show-row-separators: true;
+            show-column-separators: true;
+          }
+        };
+
+        [bottom]
+        Gtk.Box {
+          styles ["status-bar"]
+          orientation: horizontal;
+          spacing: 8;
+          margin-start: 8;
+          margin-end: 8;
+          margin-top: 3;
+          margin-bottom: 3;
+
+          Gtk.Label status_left {
+            styles ["caption", "dim-label"]
+            label: "";
+            halign: start;
+          }
+
+          Gtk.Label status_right {
+            styles ["caption", "dim-label"]
+            label: "";
+            hexpand: true;
+            halign: end;
+          }
+        }
+      };
+    };
+  };
+}
