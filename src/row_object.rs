@@ -50,4 +50,13 @@ impl RowObject {
     pub fn is_null(&self, index: usize) -> bool {
         matches!(self.imp().values.borrow().get(index), Some(Value::Null))
     }
+
+    /// Replace the cell value at `index` (after a committed edit).
+    pub fn set(&self, index: usize, value: Value) {
+        let mut values = self.imp().values.borrow().as_ref().clone();
+        if let Some(slot) = values.get_mut(index) {
+            *slot = value;
+            self.imp().values.replace(Rc::new(values));
+        }
+    }
 }

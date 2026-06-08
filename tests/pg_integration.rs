@@ -183,5 +183,18 @@ async fn run() {
     conn.execute("DELETE FROM customers WHERE email = 'addrow@x.io'").await.ok();
     conn.execute("DELETE FROM orders WHERE id = 99999").await.ok();
 
+    // Cell edit: UPDATE one column WHERE primary key, then read it back.
+    conn.execute("UPDATE \"public\".\"orders\" SET \"currency\" = 'USD' WHERE \"id\" = '20416'")
+        .await
+        .expect("update");
+    let cur = conn
+        .query("SELECT currency FROM orders WHERE id = 20416")
+        .await
+        .expect("read currency");
+    assert_eq!(cur.rows[0].values[0].to_string().trim(), "USD");
+    conn.execute("UPDATE \"public\".\"orders\" SET \"currency\" = 'EUR' WHERE \"id\" = '20416'")
+        .await
+        .ok();
+
     conn.close().await.expect("close");
 }

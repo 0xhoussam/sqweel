@@ -6,7 +6,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet};
+use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet, Value};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -62,6 +62,8 @@ mod imp {
         pub columns: RefCell<Vec<ColumnInfo>>,
         pub structure_rows: RefCell<Vec<adw::ActionRow>>,
         pub indexes_rows: RefCell<Vec<adw::ActionRow>>,
+        /// Primary-key columns as (result index, name) — empty disables editing.
+        pub pk_cols: RefCell<Vec<(usize, String)>>,
         /// (column index, ascending) of the active client-side sort.
         pub sort: RefCell<Option<(usize, bool)>>,
         pub search_term: RefCell<String>,
@@ -351,6 +353,19 @@ impl TableView {
         imp.header_row.append(&number_header(nwidth));
 
         let meta = imp.columns.borrow();
+
+        // Primary-key columns identify a row for UPDATE; without one, editing
+        // is disabled.
+        let pk_cols: Vec<(usize, String)> = result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| meta.iter().any(|m| m.name == c.name && m.is_primary_key))
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+        let editable = !pk_cols.is_empty();
+        drop(imp.pk_cols.replace(pk_cols));
+
         for (idx, column) in result.columns.iter().enumerate() {
             let numeric = is_numeric(&column.data_type);
             let badge = is_enumlike(&column.data_type);
@@ -368,8 +383,10 @@ impl TableView {
             let extra = CELL_PADDING + if badge { 18 } else { 0 } + if is_pk || is_fk { 18 } else { 0 };
             let width = (content + extra).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
 
-            // Hidden native header (title None); our header strip stands in.
-            let col = gtk::ColumnViewColumn::new(None, Some(data_factory(idx, numeric, badge, is_pk)));
+            // Edit non-badge cells in place when the table has a primary key.
+            let cell_editable = editable && !badge;
+            let factory = self.data_factory(idx, &column.name, numeric, badge, is_pk, cell_editable);
+            let col = gtk::ColumnViewColumn::new(None, Some(factory));
             col.set_fixed_width(width);
             col.set_resizable(false);
             cv.append_column(&col);
@@ -498,6 +515,146 @@ impl TableView {
 
     /// A clickable two-line header cell (bold name + dim type) with a sort
     /// chevron when this column is the active sort.
+    /// Build a column's cell factory, wiring double-click editing when allowed.
+    fn data_factory(
+        &self,
+        idx: usize,
+        col_name: &str,
+        numeric: bool,
+        badge: bool,
+        is_pk: bool,
+        editable: bool,
+    ) -> gtk::SignalListItemFactory {
+        let factory = data_factory_inner(idx, numeric, badge, is_pk);
+        if editable {
+            let weak = self.downgrade();
+            let col = col_name.to_string();
+            // Second setup pass: attach a double-click handler to the cell.
+            factory.connect_setup(move |_, item| {
+                let item = item.downcast_ref::<gtk::ListItem>().unwrap().clone();
+                let Some(child) = item.child() else { return };
+                let gesture = gtk::GestureClick::new();
+                let weak = weak.clone();
+                let col = col.clone();
+                let anchor = child.clone();
+                gesture.connect_pressed(move |_, n_press, _, _| {
+                    if n_press != 2 {
+                        return;
+                    }
+                    let (Some(this), Some(row)) =
+                        (weak.upgrade(), item.item().and_downcast::<RowObject>())
+                    else {
+                        return;
+                    };
+                    this.edit_cell(&row, idx, &col, &anchor);
+                });
+                child.add_controller(gesture);
+            });
+        }
+        factory
+    }
+
+    fn pk_pairs(&self, row: &RowObject) -> Vec<(String, String)> {
+        self.imp()
+            .pk_cols
+            .borrow()
+            .iter()
+            .map(|(i, name)| (name.clone(), row.display(*i)))
+            .collect()
+    }
+
+    /// Pop up a one-field editor anchored to a cell; commit runs an UPDATE.
+    fn edit_cell(&self, row: &RowObject, idx: usize, col: &str, anchor: &gtk::Widget) {
+        let pk = self.pk_pairs(row);
+        if pk.is_empty() {
+            return;
+        }
+        let schema = self.schema();
+        let table = self.table();
+        let old = row.display(idx);
+
+        let entry = gtk::Entry::builder().text(&old).hexpand(true).build();
+        let save = gtk::Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        let title = gtk::Label::builder()
+            .label(format!("Edit {col}"))
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        hbox.append(&entry);
+        hbox.append(&save);
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        vbox.append(&title);
+        vbox.append(&hbox);
+
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&vbox));
+        popover.set_parent(anchor);
+        popover.connect_closed(|p| p.unparent());
+
+        let this = self.clone();
+        let row = row.clone();
+        let col = col.to_string();
+        let entry_c = entry.clone();
+        let popover_c = popover.clone();
+        let anchor_c = anchor.clone();
+        let commit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            let text = entry_c.text().to_string();
+            if text == old {
+                popover_c.popdown();
+                return;
+            }
+            let new_val = (!text.is_empty()).then(|| text.clone());
+            let sql = build_update(&schema, &table, &col, new_val.as_deref(), &pk);
+            let conn = this.conn();
+            let rx = runtime::spawn(async move { conn.execute(&sql).await });
+
+            let (this, row, anchor, popover) =
+                (this.clone(), row.clone(), anchor_c.clone(), popover_c.clone());
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(_)) => {
+                        let empty = text.is_empty();
+                        row.set(idx, if empty { Value::Null } else { Value::Text(text.clone()) });
+                        if let Some(label) = anchor.downcast_ref::<gtk::Label>() {
+                            label.set_text(if empty { "NULL" } else { &text });
+                            if empty {
+                                label.add_css_class("dim-label");
+                            } else {
+                                label.remove_css_class("dim-label");
+                            }
+                        }
+                        popover.popdown();
+                    }
+                    Ok(Err(e)) => this.imp().summary.set_text(&format!("update failed: {e}")),
+                    Err(_) => {}
+                }
+            });
+        });
+
+        save.connect_clicked(glib::clone!(
+            #[strong]
+            commit,
+            move |_| commit()
+        ));
+        entry.connect_activate(glib::clone!(
+            #[strong]
+            commit,
+            move |_| commit()
+        ));
+
+        popover.popup();
+        entry.grab_focus();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn header_cell(
         &self,
@@ -765,7 +922,7 @@ fn number_header(width: i32) -> gtk::Widget {
     label.upcast()
 }
 
-fn data_factory(idx: usize, numeric: bool, badge: bool, is_pk: bool) -> gtk::SignalListItemFactory {
+fn data_factory_inner(idx: usize, numeric: bool, badge: bool, is_pk: bool) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -912,6 +1069,34 @@ fn build_insert(schema: &str, table: &str, fields: &[(String, String)]) -> Strin
     )
 }
 
+/// Build an UPDATE setting one column for the row identified by its primary
+/// key. Value and key literals are quoted/escaped; `None` sets NULL.
+fn build_update(
+    schema: &str,
+    table: &str,
+    col: &str,
+    value: Option<&str>,
+    pk: &[(String, String)],
+) -> String {
+    let set = match value {
+        Some(v) => format!("'{}'", v.replace('\'', "''")),
+        None => "NULL".to_string(),
+    };
+    let cond = pk
+        .iter()
+        .map(|(c, v)| format!("\"{}\" = '{}'", quote_ident(c), v.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "UPDATE \"{}\".\"{}\" SET \"{}\" = {} WHERE {}",
+        quote_ident(schema),
+        quote_ident(table),
+        quote_ident(col),
+        set,
+        cond
+    )
+}
+
 /// Escape LIKE metacharacters so the term matches literally.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -961,6 +1146,29 @@ mod tests {
         assert_eq!(
             super::build_insert("public", "t", &[]),
             "INSERT INTO \"public\".\"t\" DEFAULT VALUES"
+        );
+    }
+
+    #[test]
+    fn update_sets_and_targets_pk() {
+        let pk = [("id".to_string(), "42".to_string())];
+        let q = super::build_update("public", "orders", "status", Some("paid"), &pk);
+        assert_eq!(
+            q,
+            "UPDATE \"public\".\"orders\" SET \"status\" = 'paid' WHERE \"id\" = '42'"
+        );
+    }
+
+    #[test]
+    fn update_null_and_composite_pk() {
+        let pk = [
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "x'y".to_string()),
+        ];
+        let q = super::build_update("s", "t", "note", None, &pk);
+        assert_eq!(
+            q,
+            "UPDATE \"s\".\"t\" SET \"note\" = NULL WHERE \"a\" = '1' AND \"b\" = 'x''y'"
         );
     }
 
