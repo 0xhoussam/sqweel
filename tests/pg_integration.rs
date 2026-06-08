@@ -99,5 +99,18 @@ async fn run() {
         .expect("search by id");
     assert_eq!(by_id.rows.len(), 1, "exact id match via text cast");
 
+    let idx = conn.indexes("public", "orders").await.expect("indexes");
+    println!("indexes:");
+    for i in &idx {
+        println!(
+            "  {} unique={} primary={} {} ({})",
+            i.name, i.unique, i.primary, i.method, i.columns
+        );
+    }
+    let pk = idx.iter().find(|i| i.primary).expect("primary key index");
+    assert!(pk.unique);
+    assert_eq!(pk.method, "btree");
+    assert!(pk.columns.contains("id"));
+
     conn.close().await.expect("close");
 }

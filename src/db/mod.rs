@@ -14,5 +14,5 @@ pub use error::DbError;
 pub use registry::{driver, drivers};
 pub use traits::{Connection, Driver};
 pub use types::{
-    Column, ColumnInfo, ConnectionConfig, Relation, RelationKind, ResultSet, Row, Value,
+    Column, ColumnInfo, ConnectionConfig, IndexInfo, Relation, RelationKind, ResultSet, Row, Value,
 };

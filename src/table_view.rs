@@ -7,7 +7,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{ColumnInfo, Connection, ResultSet, Value};
+use crate::db::{ColumnInfo, Connection, IndexInfo, ResultSet, Value};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -45,6 +45,8 @@ mod imp {
         #[template_child]
         pub structure_group: TemplateChild<adw::PreferencesGroup>,
         #[template_child]
+        pub indexes_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
         pub search_bar: TemplateChild<gtk::SearchBar>,
         #[template_child]
         pub search_entry: TemplateChild<gtk::SearchEntry>,
@@ -56,6 +58,7 @@ mod imp {
         pub result: RefCell<Option<ResultSet>>,
         pub columns: RefCell<Vec<ColumnInfo>>,
         pub structure_rows: RefCell<Vec<adw::ActionRow>>,
+        pub indexes_rows: RefCell<Vec<adw::ActionRow>>,
         /// (column index, ascending) of the active client-side sort.
         pub sort: RefCell<Option<(usize, bool)>>,
         pub search_term: RefCell<String>,
@@ -168,20 +171,22 @@ impl TableView {
         let (sc, tb) = (schema.clone(), table.clone());
         let rx = runtime::spawn(async move {
             let columns = conn.columns(&sc, &tb).await?;
+            let indexes = conn.indexes(&sc, &tb).await?;
             let data = conn.query(&sql).await?;
-            Ok::<_, crate::db::DbError>((columns, data))
+            Ok::<_, crate::db::DbError>((columns, indexes, data))
         });
 
         let this = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok((columns, result))) => {
+                Ok(Ok((columns, indexes, result))) => {
                     let imp = this.imp();
                     imp.sort.replace(None);
                     imp.columns.replace(columns);
                     imp.result.replace(Some(result));
                     this.render();
                     this.build_structure();
+                    this.build_indexes(indexes);
                 }
                 Ok(Err(e)) => this.imp().summary.set_text(&e.to_string()),
                 Err(_) => {}
@@ -331,6 +336,59 @@ impl TableView {
             rows.push(row);
         }
         imp.structure_rows.replace(rows);
+    }
+
+    /// Populate the Indexes tab.
+    fn build_indexes(&self, indexes: Vec<IndexInfo>) {
+        let imp = self.imp();
+        for row in imp.indexes_rows.take() {
+            imp.indexes_group.remove(&row);
+        }
+        let mut rows = Vec::new();
+
+        if indexes.is_empty() {
+            let row = adw::ActionRow::builder()
+                .title("No indexes")
+                .subtitle("This table has no indexes.")
+                .build();
+            row.add_css_class("dim-label");
+            imp.indexes_group.add(&row);
+            rows.push(row);
+        } else {
+            for ix in &indexes {
+                let mut tags = Vec::new();
+                if ix.primary {
+                    tags.push("PRIMARY".to_string());
+                } else if ix.unique {
+                    tags.push("UNIQUE".to_string());
+                }
+                tags.push(ix.method.clone());
+                let subtitle = format!("{}  ·  ({})", tags.join("  ·  "), ix.columns);
+
+                let row = adw::ActionRow::builder()
+                    .title(&ix.name)
+                    .subtitle(&subtitle)
+                    .tooltip_text(&ix.definition)
+                    .build();
+                let icon = if ix.primary {
+                    "dialog-password-symbolic"
+                } else if ix.unique {
+                    "emblem-ok-symbolic"
+                } else {
+                    "view-sort-ascending-symbolic"
+                };
+                let image = gtk::Image::from_icon_name(icon);
+                if ix.primary {
+                    image.add_css_class("accent");
+                } else {
+                    image.add_css_class("dim-label");
+                }
+                row.add_prefix(&image);
+                imp.indexes_group.add(&row);
+                rows.push(row);
+            }
+        }
+        imp.indexes_rows.replace(rows);
     }
 
     /// A clickable two-line header cell (bold name + dim type) with a sort

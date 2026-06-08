@@ -5,8 +5,8 @@ use sqlx::{AssertSqlSafe, Column as _, Row as _, TypeInfo as _};
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    Column, ColumnInfo, Connection, ConnectionConfig, DbError, Driver, Relation, RelationKind,
-    ResultSet, Row, Value,
+    Column, ColumnInfo, Connection, ConnectionConfig, DbError, Driver, IndexInfo, Relation,
+    RelationKind, ResultSet, Row, Value,
 };
 
 fn conn_err(e: sqlx::Error) -> DbError {
@@ -256,6 +256,40 @@ impl Connection for PgConnection {
                     nullable,
                     default,
                 }
+            })
+            .collect())
+    }
+
+    async fn indexes(&self, schema: &str, table: &str) -> Result<Vec<IndexInfo>, DbError> {
+        let mut conn = self.pool.acquire().await.map_err(conn_err)?;
+        let rows = sqlx::query(
+            "SELECT c.relname, i.indisunique, i.indisprimary, am.amname, \
+             pg_get_indexdef(i.indexrelid), \
+             (SELECT string_agg(pg_get_indexdef(i.indexrelid, k + 1, true), ', ' ORDER BY k) \
+              FROM generate_subscripts(i.indkey, 1) AS k) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_am am ON am.oid = c.relam \
+             WHERE n.nspname = $1 AND t.relname = $2 \
+             ORDER BY i.indisprimary DESC, c.relname",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+
+        Ok(rows
+            .iter()
+            .map(|r| IndexInfo {
+                name: r.try_get(0).unwrap_or_default(),
+                unique: r.try_get(1).unwrap_or(false),
+                primary: r.try_get(2).unwrap_or(false),
+                method: r.try_get(3).unwrap_or_default(),
+                definition: r.try_get(4).unwrap_or_default(),
+                columns: r.try_get::<Option<String>, _>(5).ok().flatten().unwrap_or_default(),
             })
             .collect())
     }

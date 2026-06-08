@@ -144,10 +144,20 @@ template $TableView: Gtk.Box {
     Gtk.StackPage {
       name: "indexes";
 
-      child: Adw.StatusPage {
-        icon-name: "view-sort-ascending-symbolic";
-        title: "Indexes";
-        description: "Index details coming soon.";
+      child: Gtk.ScrolledWindow {
+        vexpand: true;
+
+        Adw.Clamp {
+          maximum-size: 760;
+          margin-top: 16;
+          margin-bottom: 16;
+          margin-start: 12;
+          margin-end: 12;
+
+          Adw.PreferencesGroup indexes_group {
+            title: "Indexes";
+          }
+        }
       };
     }
   }

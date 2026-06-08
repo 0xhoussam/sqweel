@@ -73,6 +73,19 @@ pub struct ColumnInfo {
     pub references: Option<String>,
 }
 
+/// An index on a relation (Indexes tab).
+#[derive(Clone, Debug)]
+pub struct IndexInfo {
+    pub name: String,
+    /// Comma-joined indexed columns/expressions.
+    pub columns: String,
+    /// Access method, e.g. "btree".
+    pub method: String,
+    pub unique: bool,
+    pub primary: bool,
+    pub definition: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Row {
     pub values: Vec<Value>,
