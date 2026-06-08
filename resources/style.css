@@ -26,12 +26,32 @@ columnview.data-table > listview > row > cell {
   padding: 8px 12px;
 }
 
-columnview.data-table > header > button {
-  padding: 6px 12px;
+/* Native column header is replaced by our own header strip; collapse it. */
+columnview.data-table > header {
+  min-height: 0;
 }
 
-columnview.data-table > header > button label {
-  font-size: 0.9em;
+columnview.data-table > header > button {
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: none;
+}
+
+/* Custom header strip */
+.grid-header {
+  border-bottom: 1px solid @borders;
+  background-color: @view_bg_color;
+}
+
+.header-cell {
+  padding: 6px 12px;
+  border-radius: 0;
+}
+
+.header-cell .heading {
+  font-size: 0.92em;
 }
 
 /* Status pills (enum-like columns) */
