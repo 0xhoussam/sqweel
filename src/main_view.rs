@@ -255,14 +255,14 @@ impl MainView {
 
     fn on_relation_selected(&self, index: i32) {
         let meta = self.imp().row_meta.borrow();
-        if let Some(Some((name, _, est))) = meta.get(index as usize).cloned() {
+        if let Some(Some((name, kind, est))) = meta.get(index as usize).cloned() {
             drop(meta);
-            self.open_table(&name, est);
+            self.open_table(&name, kind, est);
         }
     }
 
     /// Open a table in a tab, focusing an existing tab if already open.
-    fn open_table(&self, table: &str, estimated_rows: i64) {
+    fn open_table(&self, table: &str, kind: RelationKind, estimated_rows: i64) {
         let imp = self.imp();
         let schema = imp.current_schema.borrow().clone();
 
@@ -278,7 +278,7 @@ impl MainView {
             }
         }
 
-        let tv = TableView::new(self.conn(), &schema, table, estimated_rows);
+        let tv = TableView::new(self.conn(), &schema, table, kind, estimated_rows);
         let page = imp.tab_view.append(&tv);
         page.set_title(table);
         page.set_icon(Some(&gio::ThemedIcon::new("view-grid-symbolic")));

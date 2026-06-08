@@ -6,7 +6,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{ColumnInfo, Connection, IndexInfo, ResultSet};
+use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -56,6 +56,8 @@ mod imp {
         pub schema: RefCell<String>,
         pub table: RefCell<String>,
         pub estimated_rows: std::cell::Cell<i64>,
+        /// True for tables/partitioned tables (have a `ctid`); false for views.
+        pub is_table: std::cell::Cell<bool>,
         pub result: RefCell<Option<ResultSet>>,
         pub columns: RefCell<Vec<ColumnInfo>>,
         pub structure_rows: RefCell<Vec<adw::ActionRow>>,
@@ -140,12 +142,19 @@ glib::wrapper! {
 
 #[gtk::template_callbacks]
 impl TableView {
-    pub fn new(conn: Arc<dyn Connection>, schema: &str, table: &str, estimated_rows: i64) -> Self {
+    pub fn new(
+        conn: Arc<dyn Connection>,
+        schema: &str,
+        table: &str,
+        kind: RelationKind,
+        estimated_rows: i64,
+    ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.conn.replace(Some(conn));
         imp.schema.replace(schema.to_string());
         imp.table.replace(table.to_string());
+        imp.is_table.set(kind == RelationKind::Table);
         imp.estimated_rows.set(estimated_rows);
         obj.load();
         obj
@@ -275,11 +284,20 @@ impl TableView {
                 }
             }
         }
-        imp.columns
+        if let Some(pk) = imp
+            .columns
             .borrow()
             .iter()
             .find(|c| c.is_primary_key)
-            .map(|c| (c.name.clone(), true))
+        {
+            return Some((pk.name.clone(), true));
+        }
+        // No PK: order by the physical row id so OFFSET paging is stable.
+        // Only tables have a `ctid`; views can't be ordered this way.
+        if imp.is_table.get() {
+            return Some(("ctid".to_string(), true));
+        }
+        None
     }
 
     fn update_summary(&self) {

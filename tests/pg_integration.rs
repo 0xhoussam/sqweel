@@ -127,5 +127,27 @@ async fn run() {
     let first_p2 = page2.rows.first().unwrap().values[0].to_string();
     assert_ne!(last_p1, first_p2, "pages do not overlap");
 
+    // PK-less table: ctid gives stable OFFSET pagination.
+    let log_cols = conn.columns("public", "logs").await.expect("logs columns");
+    assert!(
+        log_cols.iter().all(|c| !c.is_primary_key),
+        "logs has no primary key"
+    );
+    let cp1 = conn
+        .query("SELECT msg FROM \"public\".\"logs\" ORDER BY \"ctid\" ASC LIMIT 500 OFFSET 0")
+        .await
+        .expect("ctid page 1");
+    let cp2 = conn
+        .query("SELECT msg FROM \"public\".\"logs\" ORDER BY \"ctid\" ASC LIMIT 500 OFFSET 500")
+        .await
+        .expect("ctid page 2");
+    assert_eq!(cp1.rows.len(), 500);
+    assert!(!cp2.rows.is_empty());
+    assert_ne!(
+        cp1.rows.last().unwrap().values[0].to_string(),
+        cp2.rows.first().unwrap().values[0].to_string(),
+        "ctid pages do not overlap"
+    );
+
     conn.close().await.expect("close");
 }
