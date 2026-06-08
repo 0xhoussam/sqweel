@@ -316,6 +316,13 @@ fn decode(row: &PgRow, i: usize) -> Value {
     if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
         return v.map(Value::Bool).unwrap_or(Value::Null);
     }
+    // NUMERIC/DECIMAL: rendered as text. `normalized()` drops the padded
+    // trailing zeros sqlx produces from pg's base-10000 representation.
+    if let Ok(v) = row.try_get::<Option<sqlx::types::BigDecimal>, _>(i) {
+        return v
+            .map(|d| Value::Text(d.normalized().to_string()))
+            .unwrap_or(Value::Null);
+    }
     if let Ok(v) = row.try_get::<Option<String>, _>(i) {
         return v.map(Value::Text).unwrap_or(Value::Null);
     }

@@ -71,6 +71,7 @@ template $TableView: Gtk.Box {
 
     Gtk.Button add_row {
       styles ["suggested-action"]
+      clicked => $on_add_row_clicked() swapped;
 
       child: Adw.ButtonContent {
         icon-name: "list-add-symbolic";

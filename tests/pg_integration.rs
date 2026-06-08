@@ -149,5 +149,39 @@ async fn run() {
         "ctid pages do not overlap"
     );
 
+    // Add-row: serial PK omitted (DEFAULT) + string-literal coercion.
+    // Idempotent: clear any leftovers from a previous run first.
+    conn.execute("DELETE FROM customers WHERE email = 'addrow@x.io'").await.ok();
+    conn.execute("DELETE FROM orders WHERE id = 99999").await.ok();
+    conn.execute(
+        "INSERT INTO \"public\".\"customers\" (\"name\", \"email\") \
+         VALUES ('addrow', 'addrow@x.io')",
+    )
+    .await
+    .expect("insert with default id");
+    let n = conn
+        .query("SELECT count(*) FROM customers WHERE email = 'addrow@x.io'")
+        .await
+        .expect("count");
+    assert_eq!(n.rows[0].values[0].to_string(), "1");
+
+    // Values passed as text literals coerce to int8 / enum / numeric / timestamptz.
+    conn.execute(
+        "INSERT INTO \"public\".\"orders\" \
+         (\"id\", \"customer_id\", \"status\", \"total\", \"currency\", \"created_at\") \
+         VALUES ('99999', '1', 'paid', '10.50', 'EUR', '2026-01-01 00:00:00')",
+    )
+    .await
+    .expect("insert with coercion");
+    let t = conn
+        .query("SELECT total FROM orders WHERE id = 99999")
+        .await
+        .expect("read back");
+    assert_eq!(t.rows[0].values[0].to_string(), "10.5", "total decoded as {:?}", t.rows[0].values[0]);
+
+    // Cleanup.
+    conn.execute("DELETE FROM customers WHERE email = 'addrow@x.io'").await.ok();
+    conn.execute("DELETE FROM orders WHERE id = 99999").await.ok();
+
     conn.close().await.expect("close");
 }

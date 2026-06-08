@@ -587,6 +587,138 @@ impl TableView {
     }
 
     #[template_callback]
+    fn on_add_row_clicked(&self) {
+        let columns = self.imp().columns.borrow().clone();
+        if columns.is_empty() {
+            return;
+        }
+        let schema = self.schema();
+        let table = self.table();
+
+        // One entry per column; empty entries are omitted from the INSERT so
+        // defaults / serials / nullable columns take over.
+        let group = adw::PreferencesGroup::new();
+        let entries: Vec<(String, adw::EntryRow)> = columns
+            .iter()
+            .map(|c| {
+                let row = adw::EntryRow::new();
+                row.set_title(&format!("{} ({})", c.name, c.data_type));
+
+                // Required = NOT NULL with no default; everything else can be
+                // left empty (DEFAULT / serial / NULL applies).
+                let required = !c.nullable && c.default.is_none();
+                let tag = gtk::Label::new(Some(if required { "required" } else { "optional" }));
+                tag.add_css_class("caption");
+                tag.add_css_class(if required { "accent" } else { "dim-label" });
+                tag.set_valign(gtk::Align::Center);
+                row.add_suffix(&tag);
+
+                let mut hint = if required {
+                    "Required".to_string()
+                } else {
+                    "Optional — leave empty for ".to_string()
+                };
+                if !required {
+                    hint.push_str(if c.default.is_some() { "the default" } else { "NULL" });
+                }
+                row.set_tooltip_text(Some(&hint));
+
+                group.add(&row);
+                (c.name.clone(), row)
+            })
+            .collect();
+
+        let clamp = adw::Clamp::builder()
+            .maximum_size(520)
+            .margin_top(16)
+            .margin_bottom(16)
+            .margin_start(12)
+            .margin_end(12)
+            .child(&group)
+            .build();
+        let scrolled = gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&clamp)
+            .build();
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&scrolled));
+
+        let header = adw::HeaderBar::new();
+        let cancel = gtk::Button::with_label("Cancel");
+        let insert = gtk::Button::with_label("Insert");
+        insert.add_css_class("suggested-action");
+        header.pack_start(&cancel);
+        header.pack_end(&insert);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&toast_overlay));
+
+        let window = adw::Window::builder()
+            .modal(true)
+            .title(format!("New row · {table}"))
+            .default_width(480)
+            .default_height(560)
+            .content(&toolbar)
+            .build();
+        if let Some(root) = self.root().and_downcast::<gtk::Window>() {
+            window.set_transient_for(Some(&root));
+        }
+
+        cancel.connect_clicked(glib::clone!(
+            #[weak]
+            window,
+            move |_| window.close()
+        ));
+
+        let this = self.clone();
+        insert.connect_clicked(glib::clone!(
+            #[weak]
+            window,
+            #[weak]
+            toast_overlay,
+            move |btn| {
+                let fields: Vec<(String, String)> = entries
+                    .iter()
+                    .filter_map(|(name, row)| {
+                        let text = row.text().to_string();
+                        (!text.is_empty()).then(|| (name.clone(), text))
+                    })
+                    .collect();
+                let sql = build_insert(&schema, &table, &fields);
+                let conn = this.conn();
+                btn.set_sensitive(false);
+                let rx = runtime::spawn(async move { conn.execute(&sql).await });
+
+                let this = this.clone();
+                glib::spawn_future_local(glib::clone!(
+                    #[weak]
+                    window,
+                    #[weak]
+                    toast_overlay,
+                    #[weak]
+                    btn,
+                    async move {
+                        match rx.recv().await {
+                            Ok(Ok(_)) => {
+                                window.close();
+                                this.reload();
+                            }
+                            Ok(Err(e)) => {
+                                toast_overlay.add_toast(adw::Toast::new(&e.to_string()));
+                                btn.set_sensitive(true);
+                            }
+                            Err(_) => btn.set_sensitive(true),
+                        }
+                    }
+                ));
+            }
+        ));
+
+        window.present();
+    }
+
+    #[template_callback]
     fn on_search_changed(&self) {
         let term = self.imp().search_entry.text().to_string();
         self.imp().search_term.replace(term);
@@ -757,6 +889,29 @@ fn build_query(
     sql
 }
 
+/// Build an INSERT for the supplied (column, value) pairs. Values are emitted
+/// as quoted string literals; Postgres coerces them to each column's type.
+/// Columns not supplied are omitted, so their DEFAULT (or NULL) applies.
+fn build_insert(schema: &str, table: &str, fields: &[(String, String)]) -> String {
+    let target = format!("\"{}\".\"{}\"", quote_ident(schema), quote_ident(table));
+    if fields.is_empty() {
+        return format!("INSERT INTO {target} DEFAULT VALUES");
+    }
+    let cols: Vec<String> = fields
+        .iter()
+        .map(|(c, _)| format!("\"{}\"", quote_ident(c)))
+        .collect();
+    let vals: Vec<String> = fields
+        .iter()
+        .map(|(_, v)| format!("'{}'", v.replace('\'', "''")))
+        .collect();
+    format!(
+        "INSERT INTO {target} ({}) VALUES ({})",
+        cols.join(", "),
+        vals.join(", ")
+    )
+}
+
 /// Escape LIKE metacharacters so the term matches literally.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -799,6 +954,26 @@ mod tests {
         let q = build_query("s", "t", "", &[], Some(&order), 500, 1000);
         assert!(q.contains("ORDER BY \"id\" DESC"), "got: {q}");
         assert!(q.ends_with("LIMIT 500 OFFSET 1000"), "got: {q}");
+    }
+
+    #[test]
+    fn insert_default_values_when_empty() {
+        assert_eq!(
+            super::build_insert("public", "t", &[]),
+            "INSERT INTO \"public\".\"t\" DEFAULT VALUES"
+        );
+    }
+
+    #[test]
+    fn insert_quotes_and_escapes() {
+        let fields = [
+            ("name".to_string(), "O'Brien".to_string()),
+            ("city".to_string(), "NYC".to_string()),
+        ];
+        assert_eq!(
+            super::build_insert("public", "users", &fields),
+            "INSERT INTO \"public\".\"users\" (\"name\", \"city\") VALUES ('O''Brien', 'NYC')"
+        );
     }
 }
 
