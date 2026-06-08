@@ -60,6 +60,19 @@ pub enum RelationKind {
     View,
 }
 
+/// A column's schema metadata (Structure tab + grid key/link decorations).
+#[derive(Clone, Debug)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub is_primary_key: bool,
+    pub is_foreign_key: bool,
+    /// "table.column" the FK points at, if any.
+    pub references: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Row {
     pub values: Vec<Value>,

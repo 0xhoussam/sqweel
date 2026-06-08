@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::{ConnectionConfig, DbError, Relation, ResultSet};
+use super::{ColumnInfo, ConnectionConfig, DbError, Relation, ResultSet};
 
 /// A database backend. One implementor per supported database (Postgres today).
 /// Adding a new database = implement this + `Connection`, register in `registry`.
@@ -47,4 +47,6 @@ pub trait Connection: Send + Sync {
     async fn schemas(&self) -> Result<Vec<String>, DbError>;
     /// Tables and views in a schema, with fast row-count estimates.
     async fn relations(&self, schema: &str) -> Result<Vec<Relation>, DbError>;
+    /// Column metadata for a relation (types, nullability, PK/FK).
+    async fn columns(&self, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, DbError>;
 }

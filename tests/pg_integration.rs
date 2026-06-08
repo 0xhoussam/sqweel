@@ -69,5 +69,22 @@ async fn run() {
     assert!(rs.columns.iter().any(|c| c.name == "status"));
     assert!(rs.columns.iter().any(|c| c.name == "total" && c.data_type == "numeric"));
 
+    let cols = conn.columns("public", "orders").await.expect("columns");
+    println!("columns:");
+    for c in &cols {
+        println!(
+            "  {} {} pk={} fk={} ref={:?}",
+            c.name, c.data_type, c.is_primary_key, c.is_foreign_key, c.references
+        );
+    }
+    let id = cols.iter().find(|c| c.name == "id").expect("id column");
+    assert!(id.is_primary_key, "id is PK");
+    let cust = cols
+        .iter()
+        .find(|c| c.name == "customer_id")
+        .expect("customer_id column");
+    assert!(cust.is_foreign_key, "customer_id is FK");
+    assert_eq!(cust.references.as_deref(), Some("customers.id"));
+
     conn.close().await.expect("close");
 }

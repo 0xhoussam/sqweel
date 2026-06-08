@@ -2,9 +2,11 @@ use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::{AssertSqlSafe, Column as _, Row as _, TypeInfo as _};
 
+use std::collections::{HashMap, HashSet};
+
 use super::{
-    Column, Connection, ConnectionConfig, DbError, Driver, Relation, RelationKind, ResultSet, Row,
-    Value,
+    Column, ColumnInfo, Connection, ConnectionConfig, DbError, Driver, Relation, RelationKind,
+    ResultSet, Row, Value,
 };
 
 fn conn_err(e: sqlx::Error) -> DbError {
@@ -174,6 +176,85 @@ impl Connection for PgConnection {
                     name,
                     kind,
                     estimated_rows: est.max(0),
+                }
+            })
+            .collect())
+    }
+
+    async fn columns(&self, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
+        let mut conn = self.pool.acquire().await.map_err(conn_err)?;
+
+        let col_rows = sqlx::query(
+            "SELECT column_name, udt_name, is_nullable, column_default \
+             FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 \
+             ORDER BY ordinal_position",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+
+        // Primary-key columns.
+        let pk_rows = sqlx::query(
+            "SELECT a.attname FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
+             AND i.indisprimary",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+        let pks: HashSet<String> = pk_rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>(0).ok())
+            .collect();
+
+        // Foreign keys -> referenced table.column.
+        let fk_rows = sqlx::query(
+            "SELECT kcu.column_name, ccu.table_name, ccu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.constraint_schema = tc.constraint_schema \
+             JOIN information_schema.constraint_column_usage ccu \
+               ON ccu.constraint_name = tc.constraint_name \
+              AND ccu.constraint_schema = tc.constraint_schema \
+             WHERE tc.constraint_type = 'FOREIGN KEY' \
+               AND tc.table_schema = $1 AND tc.table_name = $2",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(query_err)?;
+        let mut fks: HashMap<String, String> = HashMap::new();
+        for r in &fk_rows {
+            let col: String = r.try_get(0).unwrap_or_default();
+            let ref_table: String = r.try_get(1).unwrap_or_default();
+            let ref_col: String = r.try_get(2).unwrap_or_default();
+            fks.insert(col, format!("{ref_table}.{ref_col}"));
+        }
+
+        Ok(col_rows
+            .iter()
+            .map(|r| {
+                let name: String = r.try_get(0).unwrap_or_default();
+                let data_type: String = r.try_get::<String, _>(1).unwrap_or_default();
+                let nullable = r.try_get::<String, _>(2).map(|s| s == "YES").unwrap_or(true);
+                let default = r.try_get::<Option<String>, _>(3).ok().flatten();
+                let references = fks.get(&name).cloned();
+                ColumnInfo {
+                    is_primary_key: pks.contains(&name),
+                    is_foreign_key: references.is_some(),
+                    references,
+                    name,
+                    data_type,
+                    nullable,
+                    default,
                 }
             })
             .collect())

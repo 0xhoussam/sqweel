@@ -54,6 +54,11 @@ columnview.data-table > header > button {
   font-size: 0.92em;
 }
 
+/* Primary-key cell values read like links. */
+.cell-link {
+  color: @accent_color;
+}
+
 /* Status pills (enum-like columns) */
 .badge {
   border-radius: 9999px;

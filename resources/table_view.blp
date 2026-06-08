@@ -115,10 +115,20 @@ template $TableView: Gtk.Box {
     Gtk.StackPage {
       name: "structure";
 
-      child: Adw.StatusPage {
-        icon-name: "view-list-symbolic";
-        title: "Structure";
-        description: "Column details coming soon.";
+      child: Gtk.ScrolledWindow {
+        vexpand: true;
+
+        Adw.Clamp {
+          maximum-size: 760;
+          margin-top: 16;
+          margin-bottom: 16;
+          margin-start: 12;
+          margin-end: 12;
+
+          Adw.PreferencesGroup structure_group {
+            title: "Columns";
+          }
+        }
       };
     }
 

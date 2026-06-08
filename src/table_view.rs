@@ -7,7 +7,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::db::{Connection, ResultSet, Value};
+use crate::db::{ColumnInfo, Connection, ResultSet, Value};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -42,12 +42,16 @@ mod imp {
         pub grid_scroll: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
         pub summary: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub structure_group: TemplateChild<adw::PreferencesGroup>,
 
         pub conn: RefCell<Option<Arc<dyn Connection>>>,
         pub schema: RefCell<String>,
         pub table: RefCell<String>,
         pub estimated_rows: std::cell::Cell<i64>,
         pub result: RefCell<Option<ResultSet>>,
+        pub columns: RefCell<Vec<ColumnInfo>>,
+        pub structure_rows: RefCell<Vec<adw::ActionRow>>,
         /// (column index, ascending) of the active client-side sort.
         pub sort: RefCell<Option<(usize, bool)>>,
     }
@@ -126,15 +130,23 @@ impl TableView {
             quote_ident(&table)
         );
         let conn = self.conn();
-        let rx = runtime::spawn(async move { conn.query(&sql).await });
+        let (sc, tb) = (schema.clone(), table.clone());
+        let rx = runtime::spawn(async move {
+            let columns = conn.columns(&sc, &tb).await?;
+            let data = conn.query(&sql).await?;
+            Ok::<_, crate::db::DbError>((columns, data))
+        });
 
         let this = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok(result)) => {
-                    this.imp().sort.replace(None);
-                    this.imp().result.replace(Some(result));
+                Ok(Ok((columns, result))) => {
+                    let imp = this.imp();
+                    imp.sort.replace(None);
+                    imp.columns.replace(columns);
+                    imp.result.replace(Some(result));
                     this.render();
+                    this.build_structure();
                 }
                 Ok(Err(e)) => this.imp().summary.set_text(&e.to_string()),
                 Err(_) => {}
@@ -185,9 +197,13 @@ impl TableView {
         cv.append_column(&number_column(nwidth));
         imp.header_row.append(&number_header(nwidth));
 
+        let meta = imp.columns.borrow();
         for (idx, column) in result.columns.iter().enumerate() {
             let numeric = is_numeric(&column.data_type);
             let badge = is_enumlike(&column.data_type);
+            let info = meta.iter().find(|c| c.name == column.name);
+            let is_pk = info.is_some_and(|c| c.is_primary_key);
+            let is_fk = info.is_some_and(|c| c.is_foreign_key);
 
             let mut content = measure(&column.name).max(measure(&column.data_type));
             for r in sample {
@@ -195,20 +211,29 @@ impl TableView {
                     content = content.max(measure(&v.to_string()));
                 }
             }
-            // Padding (cell L/R) + dot for badges; cap at the threshold.
-            let extra = CELL_PADDING + if badge { 18 } else { 0 };
+            // Padding (cell L/R) + dot for badges + key/link icon; cap.
+            let extra = CELL_PADDING + if badge { 18 } else { 0 } + if is_pk || is_fk { 18 } else { 0 };
             let width = (content + extra).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
 
             // Hidden native header (title None); our header strip stands in.
-            let col = gtk::ColumnViewColumn::new(None, Some(data_factory(idx, numeric, badge)));
+            let col = gtk::ColumnViewColumn::new(None, Some(data_factory(idx, numeric, badge, is_pk)));
             col.set_fixed_width(width);
             col.set_resizable(false);
             cv.append_column(&col);
 
             let active = imp.sort.borrow().filter(|(i, _)| *i == idx).map(|(_, a)| a);
-            imp.header_row
-                .append(&self.header_cell(idx, &column.name, &column.data_type, width, numeric, active));
+            imp.header_row.append(&self.header_cell(
+                idx,
+                &column.name,
+                &column.data_type,
+                width,
+                numeric,
+                active,
+                is_pk,
+                is_fk,
+            ));
         }
+        drop(meta);
 
         // Hide ColumnView's native header (first child); our strip stands in.
         if let Some(header) = cv.first_child() {
@@ -229,8 +254,48 @@ impl TableView {
         ));
     }
 
+    /// Populate the Structure tab from column metadata.
+    fn build_structure(&self) {
+        let imp = self.imp();
+        for row in imp.structure_rows.take() {
+            imp.structure_group.remove(&row);
+        }
+        let mut rows = Vec::new();
+        for c in imp.columns.borrow().iter() {
+            let mut bits = vec![c.data_type.clone()];
+            if !c.nullable {
+                bits.push("not null".into());
+            }
+            if let Some(d) = &c.default {
+                bits.push(format!("default {d}"));
+            }
+            if let Some(r) = &c.references {
+                bits.push(format!("→ {r}"));
+            }
+            let row = adw::ActionRow::builder()
+                .title(&c.name)
+                .subtitle(&bits.join("  ·  "))
+                .build();
+            if c.is_primary_key {
+                let icon = gtk::Image::from_icon_name("dialog-password-symbolic");
+                icon.add_css_class("accent");
+                icon.set_tooltip_text(Some("Primary key"));
+                row.add_prefix(&icon);
+            } else if c.is_foreign_key {
+                let icon = gtk::Image::from_icon_name("insert-link-symbolic");
+                icon.add_css_class("dim-label");
+                icon.set_tooltip_text(Some("Foreign key"));
+                row.add_prefix(&icon);
+            }
+            imp.structure_group.add(&row);
+            rows.push(row);
+        }
+        imp.structure_rows.replace(rows);
+    }
+
     /// A clickable two-line header cell (bold name + dim type) with a sort
     /// chevron when this column is the active sort.
+    #[allow(clippy::too_many_arguments)]
     fn header_cell(
         &self,
         idx: usize,
@@ -239,6 +304,8 @@ impl TableView {
         width: i32,
         numeric: bool,
         active: Option<bool>,
+        is_pk: bool,
+        is_fk: bool,
     ) -> gtk::Widget {
         let button = gtk::Button::new();
         button.add_css_class("flat");
@@ -251,6 +318,17 @@ impl TableView {
 
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         top.set_halign(align);
+        if is_pk {
+            let key = gtk::Image::from_icon_name("dialog-password-symbolic");
+            key.add_css_class("accent");
+            key.set_tooltip_text(Some("Primary key"));
+            top.append(&key);
+        } else if is_fk {
+            let link = gtk::Image::from_icon_name("insert-link-symbolic");
+            link.add_css_class("dim-label");
+            link.set_tooltip_text(Some("Foreign key"));
+            top.append(&link);
+        }
         let name_label = gtk::Label::new(Some(name));
         name_label.add_css_class("heading");
         name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -334,11 +412,11 @@ fn number_header(width: i32) -> gtk::Widget {
     label.upcast()
 }
 
-fn data_factory(idx: usize, numeric: bool, badge: bool) -> gtk::SignalListItemFactory {
+fn data_factory(idx: usize, numeric: bool, badge: bool, is_pk: bool) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        item.set_child(Some(&cell_widget(badge, numeric)));
+        item.set_child(Some(&cell_widget(badge, numeric, is_pk)));
     });
     factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -359,7 +437,7 @@ fn data_factory(idx: usize, numeric: bool, badge: bool) -> gtk::SignalListItemFa
     factory
 }
 
-fn cell_widget(badge: bool, numeric: bool) -> gtk::Widget {
+fn cell_widget(badge: bool, numeric: bool, is_pk: bool) -> gtk::Widget {
     if badge {
         let bx = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         bx.set_halign(gtk::Align::Start);
@@ -375,6 +453,10 @@ fn cell_widget(badge: bool, numeric: bool) -> gtk::Widget {
         let label = gtk::Label::new(None);
         label.set_xalign(if numeric { 1.0 } else { 0.0 });
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        if is_pk {
+            // Primary-key values read like links, matching the mockup.
+            label.add_css_class("cell-link");
+        }
         label.upcast()
     }
 }
