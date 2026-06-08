@@ -76,6 +76,9 @@
               gsettings-desktop-schemas
               adwaita-icon-theme
               wrapGAppsHook4
+
+              # libdbus for keyring (secret service)
+              dbus
             ];
 
             env = {
@@ -92,6 +95,7 @@
                 pkgs.pango
                 pkgs.gdk-pixbuf
                 pkgs.gobject-introspection
+                pkgs.dbus
               ];
             };
 

@@ -165,7 +165,7 @@ impl TableView {
         // capped at MAX_COL_WIDTH (longer values ellipsize).
         let pango = self.create_pango_context();
         let layout = gtk::pango::Layout::new(&pango);
-        let mut measure = |s: &str| -> i32 {
+        let measure = |s: &str| -> i32 {
             layout.set_text(s);
             layout.pixel_size().0
         };

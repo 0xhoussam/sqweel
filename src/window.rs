@@ -6,16 +6,19 @@ use gtk::{gio, glib};
 
 use crate::db::{self, Connection, ConnectionConfig};
 use crate::main_view::MainView;
+use crate::store::{self, SavedConnection};
 
 mod imp {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Debug, Default, gtk::CompositeTemplate)]
     #[template(resource = "/com/marwa/sqweel/window.ui")]
     pub struct SqweelWindow {
         #[template_child]
         pub nav: TemplateChild<adw::NavigationView>,
+        #[template_child]
+        pub saved_group: TemplateChild<adw::PreferencesGroup>,
         #[template_child]
         pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         #[template_child]
@@ -41,6 +44,8 @@ mod imp {
 
         /// Prevents overlapping connect/test requests.
         pub busy: Cell<bool>,
+        /// Currently displayed saved-connection rows (for clearing on refresh).
+        pub saved_rows: RefCell<Vec<adw::ActionRow>>,
     }
 
     #[glib::object_subclass]
@@ -64,6 +69,7 @@ mod imp {
             self.parent_constructed();
             // Sensible defaults to mirror the mockup.
             self.port_row.set_text("5432");
+            self.obj().refresh_saved();
         }
     }
     impl WidgetImpl for SqweelWindow {}
@@ -145,6 +151,7 @@ impl SqweelWindow {
 
         self.set_busy(true);
         let cfg_for_view = cfg.clone();
+        let save = self.imp().save_row.is_active();
         let rx = crate::runtime::spawn(async move { driver.connect(&cfg).await });
 
         let this = self.clone();
@@ -153,6 +160,15 @@ impl SqweelWindow {
             this.set_busy(false);
             match result {
                 Ok(Ok(conn)) => {
+                    // Persist only after a successful connect, so we never
+                    // save unusable credentials.
+                    if save {
+                        store::upsert(
+                            SavedConnection::from_config(&cfg_for_view),
+                            &cfg_for_view.password,
+                        );
+                        this.refresh_saved();
+                    }
                     let conn: Arc<dyn Connection> = Arc::from(conn);
                     let page = MainView::new(conn, &cfg_for_view);
                     this.imp().nav.push(&page);
@@ -161,6 +177,72 @@ impl SqweelWindow {
                 Err(_) => this.toast("Connection task was dropped"),
             }
         });
+    }
+
+    /// Rebuild the saved-connections list from disk.
+    fn refresh_saved(&self) {
+        let imp = self.imp();
+        for row in imp.saved_rows.take() {
+            imp.saved_group.remove(&row);
+        }
+
+        let saved = store::load();
+        imp.saved_group.set_visible(!saved.is_empty());
+
+        let mut rows = Vec::new();
+        for conn in saved {
+            let row = adw::ActionRow::builder()
+                .title(&conn.name)
+                .subtitle(&conn.subtitle())
+                .activatable(true)
+                .build();
+
+            let icon = gtk::Image::from_icon_name("network-server-symbolic");
+            row.add_prefix(&icon);
+
+            let delete = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("Forget")
+                .css_classes(["flat"])
+                .build();
+            delete.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[strong]
+                conn,
+                move |_| {
+                    store::remove(&conn.name);
+                    this.refresh_saved();
+                }
+            ));
+            row.add_suffix(&delete);
+
+            row.connect_activated(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[strong]
+                conn,
+                move |_| this.connect_saved(&conn)
+            ));
+
+            imp.saved_group.add(&row);
+            rows.push(row);
+        }
+        imp.saved_rows.replace(rows);
+    }
+
+    /// Fill the form from a saved connection (password from keyring) and connect.
+    fn connect_saved(&self, conn: &SavedConnection) {
+        let imp = self.imp();
+        imp.type_row.set_selected(0); // PostgreSQL only for now
+        imp.host_row.set_text(&conn.host);
+        imp.port_row.set_text(&conn.port.to_string());
+        imp.database_row.set_text(&conn.database);
+        imp.username_row.set_text(&conn.username);
+        imp.password_row.set_text(&store::get_password(&conn.name));
+        imp.ssl_row.set_active(conn.ssl);
+        self.on_connect_clicked();
     }
 
     #[template_callback]

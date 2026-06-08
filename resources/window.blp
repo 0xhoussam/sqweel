@@ -66,6 +66,11 @@ template $SqweelWindow: Adw.ApplicationWindow {
                   margin-bottom: 6;
                 }
 
+                Adw.PreferencesGroup saved_group {
+                  title: "Saved connections";
+                  visible: false;
+                }
+
                 Adw.PreferencesGroup {
                   Adw.ComboRow type_row {
                     title: "Type";
