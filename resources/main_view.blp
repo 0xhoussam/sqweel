@@ -14,6 +14,7 @@ template $MainView: Adw.NavigationPage {
       child: Adw.ToolbarView {
         [top]
         Adw.HeaderBar {
+          show-back-button: false;
           show-title: false;
 
           title-widget: Gtk.Box {
@@ -80,7 +81,7 @@ template $MainView: Adw.NavigationPage {
       child: Adw.ToolbarView {
         [top]
         Adw.HeaderBar {
-          show-title: false;
+          show-back-button: false;
 
           title-widget: Gtk.Box {
             orientation: horizontal;
@@ -98,41 +99,48 @@ template $MainView: Adw.NavigationPage {
           };
 
           [end]
+          Gtk.MenuButton {
+            icon-name: "open-menu-symbolic";
+            primary: true;
+            tooltip-text: "Main Menu";
+            menu-model: main_menu;
+          }
+
+          [end]
           Gtk.Button {
             icon-name: "view-refresh-symbolic";
             tooltip-text: "Reload";
-            clicked => $on_reload_clicked() swapped;
+            clicked => $on_header_reload() swapped;
+          }
+
+          [end]
+          Gtk.Button {
+            icon-name: "system-search-symbolic";
+            tooltip-text: "Search";
+            styles ["flat"]
+          }
+
+          [end]
+          Gtk.Button {
+            label: "SQL";
+            tooltip-text: "SQL editor";
+            styles ["flat"]
           }
         }
 
         [top]
-        Gtk.Box {
-          styles ["toolbar"]
-          orientation: horizontal;
-          spacing: 6;
-          margin-start: 8;
-          margin-end: 8;
-          margin-top: 4;
-          margin-bottom: 4;
+        Adw.TabBar {
+          view: tab_view;
 
-          Gtk.Label row_summary {
-            styles ["dim-label", "caption"]
-            label: "";
-            hexpand: true;
-            halign: end;
-          }
+          end-action-widget: Gtk.Button add_tab_button {
+            icon-name: "list-add-symbolic";
+            tooltip-text: "New tab";
+            styles ["flat"]
+            clicked => $on_add_tab() swapped;
+          };
         }
 
-        content: Gtk.ScrolledWindow {
-          vexpand: true;
-          hexpand: true;
-
-          Gtk.ColumnView column_view {
-            styles ["data-table"]
-            show-row-separators: true;
-            show-column-separators: true;
-          }
-        };
+        content: Adw.TabView tab_view {};
 
         [bottom]
         Gtk.Box {
@@ -160,4 +168,13 @@ template $MainView: Adw.NavigationPage {
       };
     };
   };
+}
+
+menu main_menu {
+  section {
+    item {
+      label: "About sqweel";
+      action: "app.about";
+    }
+  }
 }

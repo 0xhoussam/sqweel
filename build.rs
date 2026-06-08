@@ -6,7 +6,11 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // Blueprint sources -> .ui (placed in OUT_DIR, mirroring the resources/ tree).
-    let blueprints = ["resources/window.blp", "resources/main_view.blp"];
+    let blueprints = [
+        "resources/window.blp",
+        "resources/main_view.blp",
+        "resources/table_view.blp",
+    ];
     let status = Command::new("blueprint-compiler")
         .arg("batch-compile")
         .arg(&out_dir) // output dir

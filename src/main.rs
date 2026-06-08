@@ -12,7 +12,11 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .build();
 
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|_| {
+        // The mockup is a light design; force it regardless of system theme.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
+        load_css();
+    });
     app.connect_activate(build_ui);
 
     app.run()

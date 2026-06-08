@@ -12,11 +12,66 @@
   min-height: 24px;
 }
 
-.data-table {
-  font-feature-settings: "tnum" 1;
-}
-
 .caption-heading {
   font-size: 0.8em;
   font-weight: bold;
+}
+
+/* Data grid */
+columnview.data-table {
+  font-feature-settings: "tnum" 1;
+}
+
+columnview.data-table > listview > row > cell {
+  padding: 8px 12px;
+}
+
+columnview.data-table > header > button {
+  padding: 6px 12px;
+}
+
+columnview.data-table > header > button label {
+  font-size: 0.9em;
+}
+
+/* Status pills (enum-like columns) */
+.badge {
+  border-radius: 9999px;
+  padding: 1px 9px;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.badge label {
+  font-weight: 600;
+}
+
+.badge .dot {
+  font-size: 0.7em;
+}
+
+.badge.green {
+  background-color: alpha(@success_color, 0.15);
+  color: @success_color;
+}
+
+.badge.yellow {
+  background-color: alpha(@warning_color, 0.18);
+  color: shade(@warning_color, 0.85);
+}
+
+.badge.red {
+  background-color: alpha(@error_color, 0.15);
+  color: @error_color;
+}
+
+.badge.neutral {
+  background-color: alpha(@window_fg_color, 0.1);
+  color: @window_fg_color;
+}
+
+/* Per-table toolbar */
+.table-toolbar {
+  padding: 6px 8px;
+  border-bottom: 1px solid @borders;
 }

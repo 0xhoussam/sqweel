@@ -1,0 +1,120 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $TableView: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Box {
+    styles ["table-toolbar"]
+    orientation: horizontal;
+    spacing: 8;
+
+    Gtk.Box {
+      styles ["linked"]
+
+      Gtk.ToggleButton data_toggle {
+        active: true;
+        toggled => $on_tab_toggled() swapped;
+
+        child: Adw.ButtonContent {
+          icon-name: "view-grid-symbolic";
+          label: "Data";
+        };
+      }
+
+      Gtk.ToggleButton structure_toggle {
+        group: data_toggle;
+        toggled => $on_tab_toggled() swapped;
+
+        child: Adw.ButtonContent {
+          icon-name: "view-list-symbolic";
+          label: "Structure";
+        };
+      }
+
+      Gtk.ToggleButton indexes_toggle {
+        group: data_toggle;
+        toggled => $on_tab_toggled() swapped;
+
+        child: Adw.ButtonContent {
+          icon-name: "view-sort-ascending-symbolic";
+          label: "Indexes";
+        };
+      }
+    }
+
+    Gtk.Label summary {
+      styles ["dim-label", "caption"]
+      label: "";
+      hexpand: true;
+      halign: end;
+    }
+
+    Gtk.Button {
+      icon-name: "funnel-symbolic";
+      tooltip-text: "Filter";
+      styles ["flat"]
+    }
+
+    Gtk.Button {
+      icon-name: "document-save-symbolic";
+      tooltip-text: "Export";
+      styles ["flat"]
+    }
+
+    Gtk.Button {
+      icon-name: "view-refresh-symbolic";
+      tooltip-text: "Reload";
+      styles ["flat"]
+      clicked => $on_reload_clicked() swapped;
+    }
+
+    Gtk.Button add_row {
+      styles ["suggested-action"]
+
+      child: Adw.ButtonContent {
+        icon-name: "list-add-symbolic";
+        label: "Add row";
+      };
+    }
+  }
+
+  Gtk.Stack view_stack {
+    vexpand: true;
+
+    Gtk.StackPage {
+      name: "data";
+
+      child: Gtk.ScrolledWindow {
+        vexpand: true;
+        hexpand: true;
+
+        Gtk.ColumnView column_view {
+          styles ["data-table"]
+          show-row-separators: true;
+          show-column-separators: true;
+        }
+      };
+    }
+
+    Gtk.StackPage {
+      name: "structure";
+
+      child: Adw.StatusPage {
+        icon-name: "view-list-symbolic";
+        title: "Structure";
+        description: "Column details coming soon.";
+      };
+    }
+
+    Gtk.StackPage {
+      name: "indexes";
+
+      child: Adw.StatusPage {
+        icon-name: "view-sort-ascending-symbolic";
+        title: "Indexes";
+        description: "Index details coming soon.";
+      };
+    }
+  }
+}

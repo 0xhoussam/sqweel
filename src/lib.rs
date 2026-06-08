@@ -7,4 +7,5 @@ pub mod db;
 pub mod main_view;
 pub mod row_object;
 pub mod runtime;
+pub mod table_view;
 pub mod window;
