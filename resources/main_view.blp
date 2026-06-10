@@ -126,6 +126,7 @@ template $MainView: Adw.NavigationPage {
             label: "SQL";
             tooltip-text: "SQL editor";
             styles ["flat"]
+            clicked => $on_sql_clicked() swapped;
           }
         }
 

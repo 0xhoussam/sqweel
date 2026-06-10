@@ -1,0 +1,98 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $SqlView: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.Box {
+    styles ["table-toolbar"]
+    orientation: horizontal;
+    spacing: 8;
+
+    Gtk.Button run_button {
+      styles ["suggested-action"]
+      tooltip-text: "Run (Ctrl+Enter)";
+      clicked => $on_run_clicked() swapped;
+
+      child: Adw.ButtonContent {
+        icon-name: "media-playback-start-symbolic";
+        label: "Run";
+      };
+    }
+
+    Gtk.Label status {
+      styles ["dim-label", "caption"]
+      label: "";
+      hexpand: true;
+      halign: end;
+    }
+  }
+
+  Gtk.Paned {
+    orientation: vertical;
+    position: 220;
+    shrink-start-child: false;
+    shrink-end-child: false;
+    vexpand: true;
+
+    start-child: Gtk.ScrolledWindow editor_scroll {
+      vexpand: true;
+      styles ["sql-editor"]
+    };
+
+    end-child: Gtk.Stack result_stack {
+      vexpand: true;
+
+      Gtk.StackPage {
+        name: "empty";
+
+        child: Adw.StatusPage {
+          icon-name: "utilities-terminal-symbolic";
+          title: "SQL editor";
+          description: "Write a statement and press Run (Ctrl+Enter).";
+        };
+      }
+
+      Gtk.StackPage {
+        name: "grid";
+
+        child: $ResultGrid result_grid {};
+      }
+
+      Gtk.StackPage {
+        name: "message";
+
+        child: Adw.StatusPage message_page {
+          icon-name: "emblem-ok-symbolic";
+          title: "";
+        };
+      }
+
+      Gtk.StackPage {
+        name: "error";
+
+        child: Gtk.ScrolledWindow {
+          vexpand: true;
+
+          Adw.Clamp {
+            maximum-size: 760;
+            margin-top: 16;
+            margin-bottom: 16;
+            margin-start: 12;
+            margin-end: 12;
+
+            Gtk.Label error_label {
+              styles ["error", "monospace"]
+              label: "";
+              halign: start;
+              valign: start;
+              xalign: 0;
+              wrap: true;
+              selectable: true;
+            }
+          }
+        };
+      }
+    };
+  }
+}

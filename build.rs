@@ -10,6 +10,8 @@ fn main() {
         "resources/window.blp",
         "resources/main_view.blp",
         "resources/table_view.blp",
+        "resources/result_grid.blp",
+        "resources/sql_view.blp",
     ];
     let status = Command::new("blueprint-compiler")
         .arg("batch-compile")

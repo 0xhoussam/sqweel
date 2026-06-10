@@ -100,3 +100,13 @@ columnview.data-table > header > button {
   padding: 6px 8px;
   border-bottom: 1px solid @borders;
 }
+
+/* SQL editor pane */
+.sql-editor {
+  border-bottom: 1px solid @borders;
+}
+
+.sql-editor textview {
+  font-family: monospace;
+  background-color: @view_bg_color;
+}

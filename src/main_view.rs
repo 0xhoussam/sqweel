@@ -7,6 +7,7 @@ use gtk::{gio, glib};
 
 use crate::db::{Connection, ConnectionConfig, DbError, Relation, RelationKind};
 use crate::runtime;
+use crate::sql_view::SqlView;
 use crate::table_view::TableView;
 
 /// Sidebar row metadata, aligned 1:1 with the rows in `relation_list`.
@@ -292,16 +293,39 @@ impl MainView {
             imp.status_left.set_text("");
             return;
         };
-        let tv = page.child().downcast::<TableView>().unwrap();
-        imp.breadcrumb
-            .set_text(&format!("{} › {}", tv.schema(), tv.table()));
-        imp.status_left.set_text(&format!(
-            "PostgreSQL {} · {} · {} · {} rows",
-            imp.server_version.borrow(),
-            tv.schema(),
-            tv.table(),
-            group_thousands(tv.estimated_rows())
-        ));
+        let child = page.child();
+        if let Some(tv) = child.downcast_ref::<TableView>() {
+            imp.breadcrumb
+                .set_text(&format!("{} › {}", tv.schema(), tv.table()));
+            imp.status_left.set_text(&format!(
+                "PostgreSQL {} · {} · {} · {} rows",
+                imp.server_version.borrow(),
+                tv.schema(),
+                tv.table(),
+                group_thousands(tv.estimated_rows())
+            ));
+        } else if let Some(sv) = child.downcast_ref::<SqlView>() {
+            imp.breadcrumb.set_text(&format!("{} › SQL", sv.schema()));
+            imp.status_left.set_text(&format!(
+                "PostgreSQL {} · SQL editor",
+                imp.server_version.borrow()
+            ));
+        } else {
+            imp.breadcrumb.set_text("—");
+            imp.status_left.set_text("");
+        }
+    }
+
+    /// Open a fresh SQL scratch editor in a new tab; returns the new view.
+    pub fn open_sql_editor(&self) -> SqlView {
+        let imp = self.imp();
+        let schema = imp.current_schema.borrow().clone();
+        let sv = SqlView::new(self.conn(), &schema);
+        let page = imp.tab_view.append(&sv);
+        page.set_title("SQL");
+        page.set_icon(Some(&gio::ThemedIcon::new("utilities-terminal-symbolic")));
+        imp.tab_view.set_selected_page(&page);
+        sv
     }
 
     fn active_table(&self) -> Option<TableView> {
@@ -327,10 +351,13 @@ impl MainView {
 
     #[template_callback]
     fn on_add_tab(&self) {
-        // Re-open the currently selected sidebar relation (no-op if already open).
-        if let Some(row) = self.imp().relation_list.selected_row() {
-            self.on_relation_selected(row.index());
-        }
+        // The "+" opens a fresh SQL scratch editor.
+        self.open_sql_editor();
+    }
+
+    #[template_callback]
+    fn on_sql_clicked(&self) {
+        self.open_sql_editor();
     }
 }
 

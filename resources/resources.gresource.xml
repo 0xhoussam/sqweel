@@ -4,6 +4,8 @@
     <file preprocess="xml-stripblanks">window.ui</file>
     <file preprocess="xml-stripblanks">main_view.ui</file>
     <file preprocess="xml-stripblanks">table_view.ui</file>
+    <file preprocess="xml-stripblanks">result_grid.ui</file>
+    <file preprocess="xml-stripblanks">sql_view.ui</file>
     <file>style.css</file>
   </gresource>
 </gresources>

@@ -4,18 +4,13 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 
 use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet, Value};
+use crate::result_grid::{GridOpts, ResultGrid};
 use crate::row_object::RowObject;
 use crate::runtime;
 
-/// Horizontal cell padding (left + right) plus breathing room on top of the
-/// measured text width.
-const CELL_PADDING: i32 = 44;
-const MIN_COL_WIDTH: i32 = 80;
-/// Threshold a column width may not exceed; longer content ellipsizes.
-const MAX_COL_WIDTH: i32 = 420;
 /// Rows fetched per page (infinite scroll).
 const PAGE_SIZE: usize = 500;
 
@@ -34,13 +29,7 @@ mod imp {
         #[template_child]
         pub view_stack: TemplateChild<gtk::Stack>,
         #[template_child]
-        pub column_view: TemplateChild<gtk::ColumnView>,
-        #[template_child]
-        pub header_row: TemplateChild<gtk::Box>,
-        #[template_child]
-        pub header_scroll: TemplateChild<gtk::ScrolledWindow>,
-        #[template_child]
-        pub grid_scroll: TemplateChild<gtk::ScrolledWindow>,
+        pub result_grid: TemplateChild<ResultGrid>,
         #[template_child]
         pub summary: TemplateChild<gtk::Label>,
         #[template_child]
@@ -69,8 +58,6 @@ mod imp {
         pub search_term: RefCell<String>,
         /// Pending debounced search timeout.
         pub search_source: RefCell<Option<glib::SourceId>>,
-        /// The live row store, kept so later pages can append.
-        pub store: RefCell<Option<gio::ListStore>>,
         /// Rows fetched so far (the OFFSET for the next page).
         pub offset: std::cell::Cell<usize>,
         /// A page fetch is in flight.
@@ -86,6 +73,8 @@ mod imp {
         type ParentType = gtk::Box;
 
         fn class_init(klass: &mut Self::Class) {
+            // Register the custom grid type so the template can instantiate it.
+            ResultGrid::ensure_type();
             klass.bind_template();
             klass.bind_template_instance_callbacks();
         }
@@ -98,23 +87,13 @@ mod imp {
     impl ObjectImpl for TableView {
         fn constructed(&self) {
             self.parent_constructed();
-            // Scroll the header strip horizontally in lockstep with the grid.
-            self.header_scroll
-                .set_hadjustment(Some(&self.grid_scroll.hadjustment()));
-
-            // Load the next page when scrolled near the bottom.
-            let vadj = self.grid_scroll.vadjustment();
             let obj = self.obj();
-            vadj.connect_value_changed(glib::clone!(
+
+            // Load the next page when the grid is scrolled near the bottom.
+            self.result_grid.set_on_near_bottom(glib::clone!(
                 #[weak]
                 obj,
-                move |adj| {
-                    let near_bottom =
-                        adj.value() + adj.page_size() >= adj.upper() - adj.page_size().max(200.0);
-                    if near_bottom {
-                        obj.load_more();
-                    }
-                }
+                move || obj.load_more()
             ));
 
             // Ctrl+F / typing opens the search bar; Esc closes it.
@@ -238,7 +217,7 @@ impl TableView {
     /// Fetch the next page and append it to the store (infinite scroll).
     fn load_more(&self) {
         let imp = self.imp();
-        if imp.loading.get() || imp.exhausted.get() || imp.store.borrow().is_none() {
+        if imp.loading.get() || imp.exhausted.get() || imp.result.borrow().is_none() {
             return;
         }
         imp.loading.set(true);
@@ -260,11 +239,7 @@ impl TableView {
             match rx.recv().await {
                 Ok(Ok(result)) => {
                     let n = result.rows.len();
-                    if let Some(store) = imp.store.borrow().as_ref() {
-                        for row in &result.rows {
-                            store.append(&RowObject::new(Rc::new(row.values.clone())));
-                        }
-                    }
+                    this.imp().result_grid.append_rows(&result.rows);
                     imp.offset.set(offset + n);
                     imp.exhausted.set(n < PAGE_SIZE);
                     this.update_summary();
@@ -304,7 +279,7 @@ impl TableView {
 
     fn update_summary(&self) {
         let imp = self.imp();
-        let shown = imp.store.borrow().as_ref().map_or(0, |s| s.n_items());
+        let shown = imp.result_grid.row_count();
         if imp.search_term.borrow().trim().is_empty() {
             imp.summary.set_text(&format!(
                 "{} rows · showing {shown}",
@@ -323,39 +298,9 @@ impl TableView {
         let guard = imp.result.borrow();
         let Some(result) = guard.as_ref() else { return };
 
-        let rows: Vec<&crate::db::Row> = result.rows.iter().collect();
-
-        // Sample widths from a slice of the rows.
-        let sample = &result.rows[..result.rows.len().min(60)];
-
-        // Measure real text widths with Pango so columns fit their content,
-        // capped at MAX_COL_WIDTH (longer values ellipsize).
-        let pango = self.create_pango_context();
-        let layout = gtk::pango::Layout::new(&pango);
-        let measure = |s: &str| -> i32 {
-            layout.set_text(s);
-            layout.pixel_size().0
-        };
-
-        // Reset header + columns.
-        while let Some(c) = imp.header_row.first_child() {
-            imp.header_row.remove(&c);
-        }
-        let cv = &imp.column_view;
-        let cols = cv.columns();
-        while let Some(item) = cols.item(0) {
-            cv.remove_column(&item.downcast::<gtk::ColumnViewColumn>().unwrap());
-        }
-
-        // Row-number column.
-        let nwidth = ((result.rows.len().to_string().len().max(1) as i32) * 9 + 28).max(48);
-        cv.append_column(&number_column(nwidth));
-        imp.header_row.append(&number_header(nwidth));
-
-        let meta = imp.columns.borrow();
-
         // Primary-key columns identify a row for UPDATE; without one, editing
         // is disabled.
+        let meta = imp.columns.borrow();
         let pk_cols: Vec<(usize, String)> = result
             .columns
             .iter()
@@ -364,60 +309,39 @@ impl TableView {
             .map(|(i, c)| (i, c.name.clone()))
             .collect();
         let editable = !pk_cols.is_empty();
+        let meta_clone = meta.clone();
+        drop(meta);
         drop(imp.pk_cols.replace(pk_cols));
 
-        for (idx, column) in result.columns.iter().enumerate() {
-            let numeric = is_numeric(&column.data_type);
-            let badge = is_enumlike(&column.data_type);
-            let info = meta.iter().find(|c| c.name == column.name);
-            let is_pk = info.is_some_and(|c| c.is_primary_key);
-            let is_fk = info.is_some_and(|c| c.is_foreign_key);
-
-            let mut content = measure(&column.name).max(measure(&column.data_type));
-            for r in sample {
-                if let Some(v) = r.values.get(idx) {
-                    content = content.max(measure(&v.to_string()));
+        // Header click re-fetches with a new ORDER BY; cell double-click edits.
+        let on_sort: Rc<dyn Fn(usize)> = {
+            let weak = self.downgrade();
+            Rc::new(move |idx| {
+                if let Some(this) = weak.upgrade() {
+                    this.sort_by(idx);
                 }
-            }
-            // Padding (cell L/R) + dot for badges + key/link icon; cap.
-            let extra = CELL_PADDING + if badge { 18 } else { 0 } + if is_pk || is_fk { 18 } else { 0 };
-            let width = (content + extra).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+            })
+        };
+        let on_edit: Rc<dyn Fn(RowObject, usize, String, gtk::Widget)> = {
+            let weak = self.downgrade();
+            Rc::new(move |row, idx, col, anchor| {
+                if let Some(this) = weak.upgrade() {
+                    this.edit_cell(&row, idx, &col, &anchor);
+                }
+            })
+        };
 
-            // Edit non-badge cells in place when the table has a primary key.
-            let cell_editable = editable && !badge;
-            let factory = self.data_factory(idx, &column.name, numeric, badge, is_pk, cell_editable);
-            let col = gtk::ColumnViewColumn::new(None, Some(factory));
-            col.set_fixed_width(width);
-            col.set_resizable(false);
-            cv.append_column(&col);
-
-            let active = imp.sort.borrow().filter(|(i, _)| *i == idx).map(|(_, a)| a);
-            imp.header_row.append(&self.header_cell(
-                idx,
-                &column.name,
-                &column.data_type,
-                width,
-                numeric,
-                active,
-                is_pk,
-                is_fk,
-            ));
-        }
-        drop(meta);
-
-        // Hide ColumnView's native header (first child); our strip stands in.
-        if let Some(header) = cv.first_child() {
-            header.set_visible(false);
-        }
-
-        // Seed the store with the first page; later pages append to it.
-        let store = gio::ListStore::new::<RowObject>();
-        for row in rows {
-            store.append(&RowObject::new(Rc::new(row.values.clone())));
-        }
-        cv.set_model(Some(&gtk::NoSelection::new(Some(store.clone()))));
+        imp.result_grid.set_result(
+            result,
+            GridOpts {
+                meta: meta_clone,
+                sort: *imp.sort.borrow(),
+                editable,
+                on_sort: Some(on_sort),
+                on_edit: Some(on_edit),
+            },
+        );
         drop(guard);
-        imp.store.replace(Some(store));
         self.update_summary();
     }
 
@@ -511,47 +435,6 @@ impl TableView {
             }
         }
         imp.indexes_rows.replace(rows);
-    }
-
-    /// A clickable two-line header cell (bold name + dim type) with a sort
-    /// chevron when this column is the active sort.
-    /// Build a column's cell factory, wiring double-click editing when allowed.
-    fn data_factory(
-        &self,
-        idx: usize,
-        col_name: &str,
-        numeric: bool,
-        badge: bool,
-        is_pk: bool,
-        editable: bool,
-    ) -> gtk::SignalListItemFactory {
-        let factory = data_factory_inner(idx, numeric, badge, is_pk);
-        if editable {
-            let weak = self.downgrade();
-            let col = col_name.to_string();
-            // Second setup pass: attach a double-click handler to the cell.
-            factory.connect_setup(move |_, item| {
-                let item = item.downcast_ref::<gtk::ListItem>().unwrap().clone();
-                let Some(child) = item.child() else { return };
-                let gesture = gtk::GestureClick::new();
-                let weak = weak.clone();
-                let col = col.clone();
-                let anchor = child.clone();
-                gesture.connect_pressed(move |_, n_press, _, _| {
-                    if n_press != 2 {
-                        return;
-                    }
-                    let (Some(this), Some(row)) =
-                        (weak.upgrade(), item.item().and_downcast::<RowObject>())
-                    else {
-                        return;
-                    };
-                    this.edit_cell(&row, idx, &col, &anchor);
-                });
-                child.add_controller(gesture);
-            });
-        }
-        factory
     }
 
     fn pk_pairs(&self, row: &RowObject) -> Vec<(String, String)> {
@@ -653,66 +536,6 @@ impl TableView {
 
         popover.popup();
         entry.grab_focus();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn header_cell(
-        &self,
-        idx: usize,
-        name: &str,
-        dtype: &str,
-        width: i32,
-        numeric: bool,
-        active: Option<bool>,
-        is_pk: bool,
-        is_fk: bool,
-    ) -> gtk::Widget {
-        let button = gtk::Button::new();
-        button.add_css_class("flat");
-        button.add_css_class("header-cell");
-        button.set_size_request(width, -1);
-
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let align = if numeric { gtk::Align::End } else { gtk::Align::Start };
-        vbox.set_halign(gtk::Align::Fill);
-
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        top.set_halign(align);
-        if is_pk {
-            let key = gtk::Image::from_icon_name("dialog-password-symbolic");
-            key.add_css_class("accent");
-            key.set_tooltip_text(Some("Primary key"));
-            top.append(&key);
-        } else if is_fk {
-            let link = gtk::Image::from_icon_name("insert-link-symbolic");
-            link.add_css_class("dim-label");
-            link.set_tooltip_text(Some("Foreign key"));
-            top.append(&link);
-        }
-        let name_label = gtk::Label::new(Some(name));
-        name_label.add_css_class("heading");
-        name_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        top.append(&name_label);
-        if let Some(asc) = active {
-            let icon = if asc { "pan-up-symbolic" } else { "pan-down-symbolic" };
-            let chevron = gtk::Image::from_icon_name(icon);
-            chevron.add_css_class("accent");
-            top.append(&chevron);
-        }
-
-        let type_label = gtk::Label::new(Some(dtype));
-        type_label.add_css_class("dim-label");
-        type_label.add_css_class("caption");
-        type_label.set_halign(align);
-        type_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-
-        vbox.append(&top);
-        vbox.append(&type_label);
-        button.set_child(Some(&vbox));
-
-        let this = self.clone();
-        button.connect_clicked(move |_| this.sort_by(idx));
-        button.upcast()
     }
 
     fn sort_by(&self, idx: usize) {
@@ -890,107 +713,6 @@ impl TableView {
             this.reload();
         });
         self.imp().search_source.replace(Some(id));
-    }
-}
-
-fn number_column(width: i32) -> gtk::ColumnViewColumn {
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::new(None);
-        label.add_css_class("dim-label");
-        label.set_xalign(1.0);
-        item.set_child(Some(&label));
-    });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = item.child().and_downcast::<gtk::Label>().unwrap();
-        label.set_text(&(item.position() + 1).to_string());
-    });
-    let col = gtk::ColumnViewColumn::new(None, Some(factory));
-    col.set_fixed_width(width);
-    col.set_resizable(false);
-    col
-}
-
-fn number_header(width: i32) -> gtk::Widget {
-    let label = gtk::Label::new(Some("#"));
-    label.add_css_class("dim-label");
-    label.add_css_class("header-cell");
-    label.set_xalign(1.0);
-    label.set_size_request(width, -1);
-    label.upcast()
-}
-
-fn data_factory_inner(idx: usize, numeric: bool, badge: bool, is_pk: bool) -> gtk::SignalListItemFactory {
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(move |_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        item.set_child(Some(&cell_widget(badge, numeric, is_pk)));
-    });
-    factory.connect_bind(move |_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let row = item.item().and_downcast::<RowObject>().unwrap();
-        let value = row.display(idx);
-        if badge {
-            bind_badge(&item.child().unwrap(), &value, row.is_null(idx));
-        } else {
-            let label = item.child().and_downcast::<gtk::Label>().unwrap();
-            label.set_text(&value);
-            if row.is_null(idx) {
-                label.add_css_class("dim-label");
-            } else {
-                label.remove_css_class("dim-label");
-            }
-        }
-    });
-    factory
-}
-
-fn cell_widget(badge: bool, numeric: bool, is_pk: bool) -> gtk::Widget {
-    if badge {
-        let bx = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        bx.set_halign(gtk::Align::Start);
-        bx.set_valign(gtk::Align::Center);
-        bx.add_css_class("badge");
-        let dot = gtk::Label::new(Some("●"));
-        dot.add_css_class("dot");
-        let label = gtk::Label::new(None);
-        bx.append(&dot);
-        bx.append(&label);
-        bx.upcast()
-    } else {
-        let label = gtk::Label::new(None);
-        label.set_xalign(if numeric { 1.0 } else { 0.0 });
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        if is_pk {
-            // Primary-key values read like links, matching the mockup.
-            label.add_css_class("cell-link");
-        }
-        label.upcast()
-    }
-}
-
-fn bind_badge(child: &gtk::Widget, value: &str, is_null: bool) {
-    let bx = child.downcast_ref::<gtk::Box>().unwrap();
-    let label = bx.last_child().and_downcast::<gtk::Label>().unwrap();
-    label.set_text(value);
-    for c in ["green", "yellow", "red", "neutral"] {
-        bx.remove_css_class(c);
-    }
-    let variant = if is_null { "neutral" } else { badge_color(value) };
-    bx.add_css_class(variant);
-    bx.set_visible(!value.is_empty());
-}
-
-fn badge_color(value: &str) -> &'static str {
-    match value.to_lowercase().as_str() {
-        "paid" | "shipped" | "active" | "completed" | "done" | "success" | "enabled" | "true" => {
-            "green"
-        }
-        "pending" | "processing" | "partial" | "warning" | "queued" => "yellow",
-        "refunded" | "failed" | "cancelled" | "canceled" | "error" | "disabled" | "false" => "red",
-        _ => "neutral",
     }
 }
 
@@ -1183,49 +905,6 @@ mod tests {
             "INSERT INTO \"public\".\"users\" (\"name\", \"city\") VALUES ('O''Brien', 'NYC')"
         );
     }
-}
-
-fn is_numeric(data_type: &str) -> bool {
-    matches!(
-        data_type,
-        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "money" | "oid"
-    )
-}
-
-/// Builtin scalar types render as text; anything else (user-defined enums,
-/// domains) gets a colored badge.
-fn is_enumlike(data_type: &str) -> bool {
-    !matches!(
-        data_type,
-        "int2"
-            | "int4"
-            | "int8"
-            | "numeric"
-            | "float4"
-            | "float8"
-            | "money"
-            | "oid"
-            | "bool"
-            | "text"
-            | "varchar"
-            | "bpchar"
-            | "char"
-            | "name"
-            | "uuid"
-            | "json"
-            | "jsonb"
-            | "xml"
-            | "bytea"
-            | "date"
-            | "time"
-            | "timetz"
-            | "timestamp"
-            | "timestamptz"
-            | "interval"
-            | "inet"
-            | "cidr"
-            | "macaddr"
-    )
 }
 
 /// Format an integer with thousands separators ("12840" -> "12,840").

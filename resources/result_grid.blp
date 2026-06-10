@@ -1,0 +1,27 @@
+using Gtk 4.0;
+
+template $ResultGrid: Gtk.Box {
+  orientation: vertical;
+
+  Gtk.ScrolledWindow header_scroll {
+    vscrollbar-policy: never;
+    hscrollbar-policy: never;
+    propagate-natural-height: true;
+
+    Gtk.Box header_row {
+      styles ["grid-header"]
+      orientation: horizontal;
+    }
+  }
+
+  Gtk.ScrolledWindow grid_scroll {
+    vexpand: true;
+    hexpand: true;
+
+    Gtk.ColumnView column_view {
+      styles ["data-table"]
+      show-row-separators: true;
+      show-column-separators: false;
+    }
+  }
+}

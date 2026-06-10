@@ -5,8 +5,10 @@
 
 pub mod db;
 pub mod main_view;
+pub mod result_grid;
 pub mod row_object;
 pub mod runtime;
+pub mod sql_view;
 pub mod store;
 pub mod table_view;
 pub mod window;

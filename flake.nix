@@ -66,6 +66,7 @@
               # GTK4 + libadwaita + Blueprint
               gtk4
               libadwaita
+              gtksourceview5
               blueprint-compiler
               glib
               gobject-introspection
@@ -89,6 +90,7 @@
               LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
                 pkgs.gtk4
                 pkgs.libadwaita
+                pkgs.gtksourceview5
                 pkgs.glib
                 pkgs.graphene
                 pkgs.cairo
@@ -103,7 +105,7 @@
             # store paths GTK won't find on its own. wrapGAppsHook4 only fixes
             # packaged builds, so wire them up for `cargo run` in the dev shell.
             shellHook = ''
-              export XDG_DATA_DIRS="${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.glib}/share/gsettings-schemas/${pkgs.glib.name}:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:$XDG_DATA_DIRS"
+              export XDG_DATA_DIRS="${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.glib}/share/gsettings-schemas/${pkgs.glib.name}:${pkgs.gtksourceview5}/share:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:$XDG_DATA_DIRS"
             '';
           };
         }
