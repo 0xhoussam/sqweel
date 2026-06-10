@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 
 use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet, Value};
 use crate::result_grid::{GridOpts, ResultGrid};
@@ -13,6 +13,66 @@ use crate::runtime;
 
 /// Rows fetched per page (infinite scroll).
 const PAGE_SIZE: usize = 500;
+
+/// A comparison used by a column filter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Contains,
+    IsNull,
+    IsNotNull,
+}
+
+impl FilterOp {
+    /// All operators, in display order, paired with their dropdown label.
+    const ALL: [(FilterOp, &'static str); 7] = [
+        (FilterOp::Eq, "="),
+        (FilterOp::Ne, "≠"),
+        (FilterOp::Lt, "<"),
+        (FilterOp::Gt, ">"),
+        (FilterOp::Contains, "contains"),
+        (FilterOp::IsNull, "is null"),
+        (FilterOp::IsNotNull, "is not null"),
+    ];
+
+    /// Whether this operator needs a value (the others are unary).
+    fn takes_value(self) -> bool {
+        !matches!(self, FilterOp::IsNull | FilterOp::IsNotNull)
+    }
+}
+
+/// A single column filter: `column op value`.
+#[derive(Clone)]
+pub struct Filter {
+    pub column: String,
+    pub op: FilterOp,
+    pub value: String,
+}
+
+impl Filter {
+    /// Render as a SQL boolean expression with the identifier quoted and the
+    /// value escaped as a string literal (Postgres coerces it to the column's
+    /// type).
+    fn to_sql(&self) -> String {
+        let col = format!("\"{}\"", quote_ident(&self.column));
+        let lit = || format!("'{}'", self.value.replace('\'', "''"));
+        match self.op {
+            FilterOp::Eq => format!("{col} = {}", lit()),
+            FilterOp::Ne => format!("{col} <> {}", lit()),
+            FilterOp::Lt => format!("{col} < {}", lit()),
+            FilterOp::Gt => format!("{col} > {}", lit()),
+            FilterOp::Contains => {
+                let pat = escape_like(&self.value).replace('\'', "''");
+                format!("CAST({col} AS text) ILIKE '%{pat}%' ESCAPE '\\'")
+            }
+            FilterOp::IsNull => format!("{col} IS NULL"),
+            FilterOp::IsNotNull => format!("{col} IS NOT NULL"),
+        }
+    }
+}
 
 mod imp {
     use super::*;
@@ -40,6 +100,8 @@ mod imp {
         pub search_bar: TemplateChild<gtk::SearchBar>,
         #[template_child]
         pub search_entry: TemplateChild<gtk::SearchEntry>,
+        #[template_child]
+        pub filter_button: TemplateChild<gtk::Button>,
 
         pub conn: RefCell<Option<Arc<dyn Connection>>>,
         pub schema: RefCell<String>,
@@ -58,6 +120,8 @@ mod imp {
         pub search_term: RefCell<String>,
         /// Pending debounced search timeout.
         pub search_source: RefCell<Option<glib::SourceId>>,
+        /// Active column filters, AND-combined into the WHERE clause.
+        pub filters: RefCell<Vec<Filter>>,
         /// Rows fetched so far (the OFFSET for the next page).
         pub offset: std::cell::Cell<usize>,
         /// A page fetch is in flight.
@@ -182,8 +246,9 @@ impl TableView {
         let table = self.table();
         let term = imp.search_term.borrow().clone();
         let names: Vec<String> = imp.columns.borrow().iter().map(|c| c.name.clone()).collect();
+        let filters = imp.filters.borrow().clone();
         let order = self.order_target();
-        let sql = build_query(&schema, &table, &term, &names, order.as_ref(), PAGE_SIZE, 0);
+        let sql = build_query(&schema, &table, &term, &names, &filters, order.as_ref(), PAGE_SIZE, 0);
         let conn = self.conn();
         let (sc, tb) = (schema.clone(), table.clone());
         let rx = runtime::spawn(async move {
@@ -226,9 +291,10 @@ impl TableView {
         let table = self.table();
         let term = imp.search_term.borrow().clone();
         let names: Vec<String> = imp.columns.borrow().iter().map(|c| c.name.clone()).collect();
+        let filters = imp.filters.borrow().clone();
         let order = self.order_target();
         let offset = imp.offset.get();
-        let sql = build_query(&schema, &table, &term, &names, order.as_ref(), PAGE_SIZE, offset);
+        let sql = build_query(&schema, &table, &term, &names, &filters, order.as_ref(), PAGE_SIZE, offset);
         let conn = self.conn();
         let rx = runtime::spawn(async move { conn.query(&sql).await });
 
@@ -714,6 +780,260 @@ impl TableView {
         });
         self.imp().search_source.replace(Some(id));
     }
+
+    /// Export the rows currently loaded in the grid to a CSV file. Only loaded
+    /// pages are written (infinite scroll); the summary reports the count.
+    #[template_callback]
+    fn on_export_clicked(&self) {
+        let imp = self.imp();
+        let guard = imp.result.borrow();
+        let Some(result) = guard.as_ref() else { return };
+        let headers: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+        let ncols = headers.len();
+        drop(guard);
+
+        let Some(store) = imp.result_grid.store() else { return };
+        let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(store.n_items() as usize);
+        for i in 0..store.n_items() {
+            let row = store.item(i).and_downcast::<RowObject>().unwrap();
+            let cells = (0..ncols)
+                .map(|c| if row.is_null(c) { None } else { Some(row.display(c)) })
+                .collect();
+            rows.push(cells);
+        }
+        let n = rows.len();
+        let csv = to_csv(&headers, &rows);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Export to CSV")
+            .initial_name(format!("{}.csv", self.table()))
+            .build();
+        let window = self.root().and_downcast::<gtk::Window>();
+        let this = self.clone();
+        dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
+            let Ok(file) = res else { return };
+            let Some(path) = file.path() else { return };
+            match std::fs::write(&path, csv.as_bytes()) {
+                Ok(()) => this
+                    .imp()
+                    .summary
+                    .set_text(&format!("exported {n} row{} → {}", plural(n), path.display())),
+                Err(e) => this.imp().summary.set_text(&format!("export failed: {e}")),
+            }
+        });
+    }
+
+    /// Pop up the column-filter editor anchored to the funnel button.
+    #[template_callback]
+    fn on_filter_clicked(&self) {
+        let columns: Vec<String> =
+            self.imp().columns.borrow().iter().map(|c| c.name.clone()).collect();
+        if columns.is_empty() {
+            return;
+        }
+
+        let rows_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        // Shared list of the live condition-row widgets, read back on Apply.
+        let conds: std::rc::Rc<RefCell<Vec<CondRow>>> = std::rc::Rc::new(RefCell::new(Vec::new()));
+
+        // Seed from active filters, or one blank row to start.
+        let existing = self.imp().filters.borrow().clone();
+        let seeds: Vec<Option<Filter>> = if existing.is_empty() {
+            vec![None]
+        } else {
+            existing.into_iter().map(Some).collect()
+        };
+        for seed in &seeds {
+            let row = build_condition_row(&columns, seed.as_ref());
+            rows_box.append(&row.widget);
+            conds.borrow_mut().push(row);
+        }
+
+        let add_button = gtk::Button::builder()
+            .child(&adw::ButtonContent::builder().icon_name("list-add-symbolic").label("Add condition").build())
+            .css_classes(["flat"])
+            .build();
+        let columns_for_add = columns.clone();
+        add_button.connect_clicked(glib::clone!(
+            #[strong]
+            conds,
+            #[weak]
+            rows_box,
+            move |_| {
+                let row = build_condition_row(&columns_for_add, None);
+                rows_box.append(&row.widget);
+                conds.borrow_mut().push(row);
+            }
+        ));
+
+        let clear = gtk::Button::with_label("Clear");
+        let apply = gtk::Button::with_label("Apply");
+        apply.add_css_class("suggested-action");
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        actions.append(&clear);
+        actions.append(&spacer);
+        actions.append(&apply);
+
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(10)
+            .margin_bottom(10)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+        let title = gtk::Label::builder()
+            .label("Filter rows")
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        vbox.append(&title);
+        vbox.append(&rows_box);
+        vbox.append(&add_button);
+        vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        vbox.append(&actions);
+
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&vbox));
+        popover.set_parent(&*self.imp().filter_button);
+        popover.connect_closed(|p| p.unparent());
+
+        let this = self.clone();
+        let popover_c = popover.clone();
+        apply.connect_clicked(glib::clone!(
+            #[strong]
+            conds,
+            move |_| {
+                let filters: Vec<Filter> =
+                    conds.borrow().iter().filter_map(CondRow::to_filter).collect();
+                this.imp().filters.replace(filters);
+                this.update_filter_indicator();
+                popover_c.popdown();
+                this.load();
+            }
+        ));
+
+        let this = self.clone();
+        let popover_c = popover.clone();
+        clear.connect_clicked(move |_| {
+            this.imp().filters.borrow_mut().clear();
+            this.update_filter_indicator();
+            popover_c.popdown();
+            this.load();
+        });
+
+        popover.popup();
+    }
+
+    /// Reflect active filters on the funnel button (accent + count tooltip).
+    fn update_filter_indicator(&self) {
+        let imp = self.imp();
+        let n = imp.filters.borrow().len();
+        if n == 0 {
+            imp.filter_button.remove_css_class("accent");
+            imp.filter_button.set_tooltip_text(Some("Filter"));
+        } else {
+            imp.filter_button.add_css_class("accent");
+            imp.filter_button
+                .set_tooltip_text(Some(&format!("Filtered ({n})")));
+        }
+    }
+}
+
+/// Widgets backing one row of the filter editor.
+struct CondRow {
+    widget: gtk::Box,
+    column: gtk::DropDown,
+    op: gtk::DropDown,
+    value: gtk::Entry,
+}
+
+impl CondRow {
+    /// Read this row into a `Filter`, or `None` if it isn't usable (a
+    /// value-taking operator with an empty value).
+    fn to_filter(&self) -> Option<Filter> {
+        let columns = self.column.model()?.downcast::<gtk::StringList>().ok()?;
+        let column = columns.string(self.column.selected())?.to_string();
+        let op = FilterOp::ALL[self.op.selected() as usize].0;
+        let value = self.value.text().to_string();
+        if op.takes_value() && value.is_empty() {
+            return None;
+        }
+        Some(Filter { column, op, value })
+    }
+}
+
+/// Build one `column op value` row for the filter editor, seeded from an
+/// existing filter when given.
+fn build_condition_row(columns: &[String], seed: Option<&Filter>) -> CondRow {
+    let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+    let col_model = gtk::StringList::new(&columns.iter().map(String::as_str).collect::<Vec<_>>());
+    let column = gtk::DropDown::builder().model(&col_model).build();
+
+    let op_labels: Vec<&str> = FilterOp::ALL.iter().map(|(_, l)| *l).collect();
+    let op_model = gtk::StringList::new(&op_labels);
+    let op = gtk::DropDown::builder().model(&op_model).build();
+
+    let value = gtk::Entry::builder().hexpand(true).placeholder_text("value").build();
+
+    if let Some(f) = seed {
+        if let Some(pos) = columns.iter().position(|c| c == &f.column) {
+            column.set_selected(pos as u32);
+        }
+        if let Some(pos) = FilterOp::ALL.iter().position(|(o, _)| *o == f.op) {
+            op.set_selected(pos as u32);
+        }
+        value.set_text(&f.value);
+    }
+
+    // Unary operators (is null / is not null) don't take a value.
+    let value_for_toggle = value.clone();
+    let sync_value = move |dd: &gtk::DropDown| {
+        let takes = FilterOp::ALL[dd.selected() as usize].0.takes_value();
+        value_for_toggle.set_sensitive(takes);
+    };
+    sync_value(&op);
+    op.connect_selected_notify(sync_value);
+
+    widget.append(&column);
+    widget.append(&op);
+    widget.append(&value);
+    CondRow { widget, column, op, value }
+}
+
+/// "" for 1, "s" otherwise.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Render rows as CSV (RFC 4180-ish): a header line then one line per row,
+/// `None` cells empty, fields quoted when they contain a comma/quote/newline.
+fn to_csv(headers: &[String], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = String::new();
+    out.push_str(&headers.iter().map(|h| csv_field(h)).collect::<Vec<_>>().join(","));
+    out.push('\n');
+    for row in rows {
+        let line = row
+            .iter()
+            .map(|c| c.as_deref().map(csv_field).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+fn csv_field(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
+    }
 }
 
 /// Double any embedded quotes so an identifier is safe inside `"..."`.
@@ -725,11 +1045,13 @@ fn quote_ident(ident: &str) -> String {
 /// (cast to text) when a search term is present, an optional ORDER BY, and
 /// LIMIT/OFFSET. The term is escaped for both the SQL string literal and LIKE
 /// metacharacters; identifiers are quoted.
+#[allow(clippy::too_many_arguments)]
 fn build_query(
     schema: &str,
     table: &str,
     term: &str,
     columns: &[String],
+    filters: &[Filter],
     order: Option<&(String, bool)>,
     limit: usize,
     offset: usize,
@@ -740,6 +1062,9 @@ fn build_query(
         quote_ident(table)
     );
 
+    // WHERE is the AND of the free-text search (an OR across all columns) and
+    // each active column filter.
+    let mut clauses: Vec<String> = Vec::new();
     let term = term.trim();
     if !term.is_empty() && !columns.is_empty() {
         let pattern = escape_like(term).replace('\'', "''");
@@ -753,7 +1078,13 @@ fn build_query(
                 )
             })
             .collect();
-        sql.push_str(&format!(" WHERE {}", conds.join(" OR ")));
+        clauses.push(format!("({})", conds.join(" OR ")));
+    }
+    for f in filters {
+        clauses.push(f.to_sql());
+    }
+    if !clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
     }
 
     if let Some((col, asc)) = order {
@@ -838,27 +1169,62 @@ mod tests {
     #[test]
     fn plain_when_no_term() {
         assert_eq!(
-            build_query("public", "orders", "", &["id".to_string()], None, 500, 0),
+            build_query("public", "orders", "", &["id".to_string()], &[], None, 500, 0),
             "SELECT * FROM \"public\".\"orders\" LIMIT 500 OFFSET 0"
         );
     }
 
     #[test]
     fn escapes_quotes_and_like_metachars() {
-        let q = build_query("public", "t", "a'b%c", &["x".to_string()], None, 500, 0);
+        let q = build_query("public", "t", "a'b%c", &["x".to_string()], &[], None, 500, 0);
         assert!(q.contains(r"ILIKE '%a''b\%c%' ESCAPE '\'"), "got: {q}");
     }
 
     #[test]
     fn ors_all_columns() {
-        let q = build_query("s", "t", "z", &["a".to_string(), "b".to_string()], None, 500, 0);
+        let q = build_query("s", "t", "z", &["a".to_string(), "b".to_string()], &[], None, 500, 0);
         assert!(q.contains("\"a\"") && q.contains("\"b\"") && q.contains(" OR "));
+    }
+
+    #[test]
+    fn filters_and_with_search() {
+        use super::{Filter, FilterOp};
+        let filters = [
+            Filter { column: "status".into(), op: FilterOp::Eq, value: "paid".into() },
+            Filter { column: "total".into(), op: FilterOp::Gt, value: "10".into() },
+        ];
+        let q = build_query("s", "t", "ab", &["status".to_string()], &filters, None, 500, 0);
+        assert!(q.contains("WHERE ("), "got: {q}");
+        assert!(q.contains(") AND \"status\" = 'paid' AND \"total\" > '10'"), "got: {q}");
+    }
+
+    #[test]
+    fn csv_headers_nulls_and_quoting() {
+        let headers = vec!["id".to_string(), "note".to_string()];
+        let rows = vec![
+            vec![Some("1".to_string()), Some("a,b".to_string())],
+            vec![Some("2".to_string()), None],
+            vec![Some("3".to_string()), Some("say \"hi\"".to_string())],
+        ];
+        let csv = super::to_csv(&headers, &rows);
+        assert_eq!(
+            csv,
+            "id,note\n1,\"a,b\"\n2,\n3,\"say \"\"hi\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn filter_unary_and_null_ops() {
+        use super::{Filter, FilterOp};
+        let f = [Filter { column: "note".into(), op: FilterOp::IsNull, value: String::new() }];
+        let q = build_query("s", "t", "", &[], &f, None, 500, 0);
+        assert!(q.contains("WHERE \"note\" IS NULL"), "got: {q}");
     }
 
     #[test]
     fn order_and_offset() {
         let order = ("id".to_string(), false);
-        let q = build_query("s", "t", "", &[], Some(&order), 500, 1000);
+        let q = build_query("s", "t", "", &[], &[], Some(&order), 500, 1000);
         assert!(q.contains("ORDER BY \"id\" DESC"), "got: {q}");
         assert!(q.ends_with("LIMIT 500 OFFSET 1000"), "got: {q}");
     }

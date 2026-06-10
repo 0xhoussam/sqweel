@@ -129,6 +129,11 @@ impl ResultGrid {
         self.imp().store.borrow().as_ref().map_or(0, |s| s.n_items())
     }
 
+    /// The live row store (loaded rows), if a result has been set.
+    pub fn store(&self) -> Option<gio::ListStore> {
+        self.imp().store.borrow().clone()
+    }
+
     /// Append a page of rows to the existing store (infinite scroll).
     pub fn append_rows(&self, rows: &[Row]) {
         if let Some(store) = self.imp().store.borrow().as_ref() {

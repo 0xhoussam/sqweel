@@ -50,16 +50,18 @@ template $TableView: Gtk.Box {
       halign: end;
     }
 
-    Gtk.Button {
+    Gtk.Button filter_button {
       icon-name: "funnel-symbolic";
       tooltip-text: "Filter";
       styles ["flat"]
+      clicked => $on_filter_clicked() swapped;
     }
 
     Gtk.Button {
       icon-name: "document-save-symbolic";
-      tooltip-text: "Export";
+      tooltip-text: "Export to CSV";
       styles ["flat"]
+      clicked => $on_export_clicked() swapped;
     }
 
     Gtk.Button {
