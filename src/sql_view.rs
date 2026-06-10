@@ -1,9 +1,12 @@
-//! A SQL scratch editor: a GtkSourceView input over a results pane. Statements
-//! are routed by their leading keyword — queries (`SELECT`, `WITH`, …) render
-//! in a `ResultGrid`; everything else runs as `execute` and reports rows
-//! affected. Read-only: no inline editing, sorting, or pagination.
+//! A minimal notebook-style SQL editor: a vertical list of cells. Each cell is
+//! an independent GtkSourceView statement with its own Run / Delete buttons and
+//! its own inline result (a read-only grid for queries, a message for other
+//! statements, an error panel on failure). Statements route by their leading
+//! keyword (see [`is_query`]). No ordering, no shared state between cells —
+//! just the cell idea, kept deliberately small.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
@@ -15,6 +18,10 @@ use crate::db::Connection;
 use crate::result_grid::{GridOpts, ResultGrid};
 use crate::runtime;
 
+// ---------------------------------------------------------------------------
+// SqlView — the cell container
+// ---------------------------------------------------------------------------
+
 mod imp {
     use super::*;
 
@@ -22,25 +29,11 @@ mod imp {
     #[template(resource = "/com/marwa/sqweel/sql_view.ui")]
     pub struct SqlView {
         #[template_child]
-        pub run_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub status: TemplateChild<gtk::Label>,
-        #[template_child]
-        pub editor_scroll: TemplateChild<gtk::ScrolledWindow>,
-        #[template_child]
-        pub result_stack: TemplateChild<gtk::Stack>,
-        #[template_child]
-        pub result_grid: TemplateChild<ResultGrid>,
-        #[template_child]
-        pub message_page: TemplateChild<adw::StatusPage>,
-        #[template_child]
-        pub error_label: TemplateChild<gtk::Label>,
+        pub cells_box: TemplateChild<gtk::Box>,
 
         pub conn: RefCell<Option<Arc<dyn Connection>>>,
         pub schema: RefCell<String>,
-        pub buffer: RefCell<Option<sourceview5::Buffer>>,
-        /// A statement is in flight.
-        pub running: std::cell::Cell<bool>,
+        pub cells: RefCell<Vec<super::SqlCell>>,
     }
 
     #[glib::object_subclass]
@@ -50,8 +43,6 @@ mod imp {
         type ParentType = gtk::Box;
 
         fn class_init(klass: &mut Self::Class) {
-            // Register the custom grid type so the template can instantiate it.
-            ResultGrid::ensure_type();
             klass.bind_template();
             klass.bind_template_instance_callbacks();
         }
@@ -61,12 +52,156 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for SqlView {
+    impl ObjectImpl for SqlView {}
+    impl WidgetImpl for SqlView {}
+    impl BoxImpl for SqlView {}
+}
+
+glib::wrapper! {
+    pub struct SqlView(ObjectSubclass<imp::SqlView>)
+        @extends gtk::Box, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Orientable;
+}
+
+#[gtk::template_callbacks]
+impl SqlView {
+    pub fn new(conn: Arc<dyn Connection>, schema: &str) -> Self {
+        let obj: Self = glib::Object::new();
+        let imp = obj.imp();
+        imp.conn.replace(Some(conn));
+        imp.schema.replace(schema.to_string());
+        obj.add_cell();
+        obj
+    }
+
+    pub fn schema(&self) -> String {
+        self.imp().schema.borrow().clone()
+    }
+
+    fn conn(&self) -> Arc<dyn Connection> {
+        self.imp().conn.borrow().as_ref().expect("connection set").clone()
+    }
+
+    /// Append a new empty cell and focus its editor; returns it.
+    pub fn add_cell(&self) -> SqlCell {
+        let imp = self.imp();
+        let cell = SqlCell::new(self.conn(), &self.schema());
+        imp.cells_box.append(&cell);
+
+        // Wire the cell's Delete button to remove it from the notebook.
+        let weak = self.downgrade();
+        let cell_weak = cell.downgrade();
+        cell.set_on_delete(move || {
+            if let (Some(this), Some(cell)) = (weak.upgrade(), cell_weak.upgrade()) {
+                this.imp().cells_box.remove(&cell);
+                this.imp().cells.borrow_mut().retain(|c| c != &cell);
+                // Keep at least one cell around to type into.
+                if this.imp().cells.borrow().is_empty() {
+                    this.add_cell();
+                }
+            }
+        });
+
+        imp.cells.borrow_mut().push(cell.clone());
+        cell.focus_editor();
+        cell
+    }
+
+    /// The first cell, if any (used by smoke tests).
+    pub fn first_cell(&self) -> Option<SqlCell> {
+        self.imp().cells.borrow().first().cloned()
+    }
+
+    #[template_callback]
+    fn on_add_cell(&self) {
+        self.add_cell();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SqlCell — one editor + result
+// ---------------------------------------------------------------------------
+
+mod cell_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct SqlCell {
+        pub conn: RefCell<Option<Arc<dyn Connection>>>,
+        pub schema: RefCell<String>,
+        pub view: RefCell<Option<sourceview5::View>>,
+        pub buffer: RefCell<Option<sourceview5::Buffer>>,
+        pub run_button: RefCell<Option<gtk::Button>>,
+        pub status: RefCell<Option<gtk::Label>>,
+        pub result_box: RefCell<Option<gtk::Box>>,
+        pub result_stack: RefCell<Option<gtk::Stack>>,
+        pub result_grid: RefCell<Option<ResultGrid>>,
+        pub message_label: RefCell<Option<gtk::Label>>,
+        pub error_label: RefCell<Option<gtk::Label>>,
+        pub on_delete: RefCell<Option<Rc<dyn Fn()>>>,
+        pub running: Cell<bool>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for SqlCell {
+        const NAME: &'static str = "SqlCell";
+        type Type = super::SqlCell;
+        type ParentType = gtk::Box;
+    }
+
+    impl ObjectImpl for SqlCell {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
+            obj.set_orientation(gtk::Orientation::Vertical);
+            obj.add_css_class("sql-cell");
 
-            // Build the SQL source editor and drop it into the scroller.
+            // --- Toolbar: Run · status · Delete --------------------------------
+            let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            toolbar.add_css_class("cell-toolbar");
+
+            let run_button = gtk::Button::builder()
+                .tooltip_text("Run (Ctrl+Enter)")
+                .css_classes(["suggested-action"])
+                .child(
+                    &adw::ButtonContent::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .label("Run")
+                        .build(),
+                )
+                .build();
+            run_button.connect_clicked(glib::clone!(
+                #[weak]
+                obj,
+                move |_| obj.run()
+            ));
+
+            let status = gtk::Label::builder()
+                .css_classes(["dim-label", "caption"])
+                .hexpand(true)
+                .halign(gtk::Align::End)
+                .build();
+
+            let delete_button = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Delete cell")
+                .css_classes(["flat"])
+                .build();
+            delete_button.connect_clicked(glib::clone!(
+                #[weak]
+                obj,
+                move |_| {
+                    if let Some(cb) = obj.imp().on_delete.borrow().as_ref() {
+                        cb();
+                    }
+                }
+            ));
+
+            toolbar.append(&run_button);
+            toolbar.append(&status);
+            toolbar.append(&delete_button);
+
+            // --- Editor --------------------------------------------------------
             let buffer = sourceview5::Buffer::new(None);
             if let Some(lang) = sourceview5::LanguageManager::default().language("sql") {
                 buffer.set_language(Some(&lang));
@@ -88,41 +223,95 @@ mod imp {
             view.set_bottom_margin(6);
             view.set_left_margin(6);
             view.set_right_margin(6);
-            self.editor_scroll.set_child(Some(&view));
-            self.buffer.replace(Some(buffer));
 
-            // Ctrl+Enter runs the current statement.
+            let editor_scroll = gtk::ScrolledWindow::builder()
+                .css_classes(["sql-editor"])
+                .min_content_height(72)
+                .max_content_height(240)
+                .propagate_natural_height(true)
+                .child(&view)
+                .build();
+
+            // Ctrl+Enter runs this cell.
             let controller = gtk::ShortcutController::new();
-            let trigger = gtk::ShortcutTrigger::parse_string("<Control>Return");
-            let action = gtk::CallbackAction::new(glib::clone!(
-                #[weak]
-                obj,
-                #[upgrade_or]
-                glib::Propagation::Proceed,
-                move |_, _| {
-                    obj.run();
-                    glib::Propagation::Stop
-                }
-            ));
-            if let Some(trigger) = trigger {
+            if let Some(trigger) = gtk::ShortcutTrigger::parse_string("<Control>Return") {
+                let action = gtk::CallbackAction::new(glib::clone!(
+                    #[weak]
+                    obj,
+                    #[upgrade_or]
+                    glib::Propagation::Proceed,
+                    move |_, _| {
+                        obj.run();
+                        glib::Propagation::Stop
+                    }
+                ));
                 controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
             }
             view.add_controller(controller);
+
+            // --- Result (hidden until the first run) ---------------------------
+            let result_grid = ResultGrid::new();
+            result_grid.set_vexpand(false);
+            result_grid.set_size_request(-1, 220);
+
+            let message_label = gtk::Label::builder()
+                .css_classes(["dim-label"])
+                .xalign(0.0)
+                .margin_top(8)
+                .margin_bottom(8)
+                .margin_start(8)
+                .margin_end(8)
+                .build();
+
+            let error_label = gtk::Label::builder()
+                .css_classes(["error", "monospace"])
+                .xalign(0.0)
+                .wrap(true)
+                .selectable(true)
+                .margin_top(8)
+                .margin_bottom(8)
+                .margin_start(8)
+                .margin_end(8)
+                .build();
+
+            let result_stack = gtk::Stack::new();
+            result_stack.add_named(&result_grid, Some("grid"));
+            result_stack.add_named(&message_label, Some("message"));
+            result_stack.add_named(&error_label, Some("error"));
+
+            let result_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            result_box.add_css_class("cell-result");
+            result_box.append(&result_stack);
+            result_box.set_visible(false);
+
+            obj.append(&toolbar);
+            obj.append(&editor_scroll);
+            obj.append(&result_box);
+
+            // Stash widgets we need later.
+            self.view.replace(Some(view));
+            self.buffer.replace(Some(buffer));
+            self.run_button.replace(Some(run_button));
+            self.status.replace(Some(status));
+            self.result_box.replace(Some(result_box));
+            self.result_stack.replace(Some(result_stack));
+            self.result_grid.replace(Some(result_grid));
+            self.message_label.replace(Some(message_label));
+            self.error_label.replace(Some(error_label));
         }
     }
-    impl WidgetImpl for SqlView {}
-    impl BoxImpl for SqlView {}
+    impl WidgetImpl for SqlCell {}
+    impl BoxImpl for SqlCell {}
 }
 
 glib::wrapper! {
-    pub struct SqlView(ObjectSubclass<imp::SqlView>)
+    pub struct SqlCell(ObjectSubclass<cell_imp::SqlCell>)
         @extends gtk::Box, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Orientable;
 }
 
-#[gtk::template_callbacks]
-impl SqlView {
-    pub fn new(conn: Arc<dyn Connection>, schema: &str) -> Self {
+impl SqlCell {
+    fn new(conn: Arc<dyn Connection>, schema: &str) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.conn.replace(Some(conn));
@@ -130,27 +319,28 @@ impl SqlView {
         obj
     }
 
-    pub fn schema(&self) -> String {
-        self.imp().schema.borrow().clone()
-    }
-
     fn conn(&self) -> Arc<dyn Connection> {
         self.imp().conn.borrow().as_ref().expect("connection set").clone()
     }
 
-    /// Replace the editor contents (used by automated smoke tests).
+    /// Register the handler invoked when the cell's Delete button is clicked.
+    fn set_on_delete(&self, f: impl Fn() + 'static) {
+        self.imp().on_delete.replace(Some(Rc::new(f)));
+    }
+
+    fn focus_editor(&self) {
+        if let Some(view) = self.imp().view.borrow().as_ref() {
+            view.grab_focus();
+        }
+    }
+
+    /// Replace the cell's editor contents (used by smoke tests).
     pub fn set_sql(&self, sql: &str) {
         if let Some(buffer) = self.imp().buffer.borrow().as_ref() {
             buffer.set_text(sql);
         }
     }
 
-    /// Run the current statement (same as pressing Run / Ctrl+Enter).
-    pub fn run_statement(&self) {
-        self.run();
-    }
-
-    /// The full editor contents.
     fn sql_text(&self) -> String {
         let imp = self.imp();
         let guard = imp.buffer.borrow();
@@ -159,9 +349,25 @@ impl SqlView {
         buffer.text(&start, &end, false).to_string()
     }
 
-    /// Run the editor's statement: queries fill the grid, other statements
+    fn set_status(&self, text: &str) {
+        if let Some(label) = self.imp().status.borrow().as_ref() {
+            label.set_text(text);
+        }
+    }
+
+    fn show_result(&self, page: &str) {
+        let imp = self.imp();
+        if let Some(stack) = imp.result_stack.borrow().as_ref() {
+            stack.set_visible_child_name(page);
+        }
+        if let Some(bx) = imp.result_box.borrow().as_ref() {
+            bx.set_visible(true);
+        }
+    }
+
+    /// Run this cell's statement: queries fill the grid, other statements
     /// report rows affected. No-ops while a statement is already in flight.
-    fn run(&self) {
+    pub fn run(&self) {
         let imp = self.imp();
         if imp.running.get() {
             return;
@@ -171,69 +377,77 @@ impl SqlView {
             return;
         }
         imp.running.set(true);
-        imp.run_button.set_sensitive(false);
-        imp.status.set_text("running…");
+        if let Some(btn) = imp.run_button.borrow().as_ref() {
+            btn.set_sensitive(false);
+        }
+        self.set_status("running…");
 
         let started = std::time::Instant::now();
         let conn = self.conn();
+        let query = is_query(&sql);
 
-        if is_query(&sql) {
+        let this = self.clone();
+        if query {
             let rx = runtime::spawn(async move { conn.query(&sql).await });
-            let this = self.clone();
             glib::spawn_future_local(async move {
-                let imp = this.imp();
-                imp.running.set(false);
-                imp.run_button.set_sensitive(true);
+                this.finish_running();
                 let ms = started.elapsed().as_millis();
                 match rx.recv().await {
                     Ok(Ok(result)) => {
                         let n = result.rows.len();
-                        imp.result_grid.set_result(&result, GridOpts::default());
-                        imp.result_stack.set_visible_child_name("grid");
-                        imp.status.set_text(&format!(
-                            "{n} row{} · {ms} ms",
-                            if n == 1 { "" } else { "s" }
-                        ));
+                        if let Some(grid) = this.imp().result_grid.borrow().as_ref() {
+                            grid.set_result(&result, GridOpts::default());
+                        }
+                        this.show_result("grid");
+                        this.set_status(&format!("{n} row{} · {ms} ms", plural(n)));
                     }
                     Ok(Err(e)) => this.show_error(&e.to_string()),
-                    Err(_) => imp.status.set_text(""),
+                    Err(_) => this.set_status(""),
                 }
             });
         } else {
             let rx = runtime::spawn(async move { conn.execute(&sql).await });
-            let this = self.clone();
             glib::spawn_future_local(async move {
-                let imp = this.imp();
-                imp.running.set(false);
-                imp.run_button.set_sensitive(true);
+                this.finish_running();
                 let ms = started.elapsed().as_millis();
                 match rx.recv().await {
                     Ok(Ok(affected)) => {
-                        imp.message_page.set_title(&format!(
-                            "{affected} row{} affected",
-                            if affected == 1 { "" } else { "s" }
-                        ));
-                        imp.result_stack.set_visible_child_name("message");
-                        imp.status.set_text(&format!("done · {ms} ms"));
+                        if let Some(label) = this.imp().message_label.borrow().as_ref() {
+                            label.set_text(&format!(
+                                "{affected} row{} affected",
+                                plural(affected as usize)
+                            ));
+                        }
+                        this.show_result("message");
+                        this.set_status(&format!("done · {ms} ms"));
                     }
                     Ok(Err(e)) => this.show_error(&e.to_string()),
-                    Err(_) => imp.status.set_text(""),
+                    Err(_) => this.set_status(""),
                 }
             });
         }
     }
 
-    fn show_error(&self, msg: &str) {
+    fn finish_running(&self) {
         let imp = self.imp();
-        imp.error_label.set_text(msg);
-        imp.result_stack.set_visible_child_name("error");
-        imp.status.set_text("error");
+        imp.running.set(false);
+        if let Some(btn) = imp.run_button.borrow().as_ref() {
+            btn.set_sensitive(true);
+        }
     }
 
-    #[template_callback]
-    fn on_run_clicked(&self) {
-        self.run();
+    fn show_error(&self, msg: &str) {
+        if let Some(label) = self.imp().error_label.borrow().as_ref() {
+            label.set_text(msg);
+        }
+        self.show_result("error");
+        self.set_status("error");
     }
+}
+
+/// "" for 1, "s" otherwise.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Whether a statement returns rows (and should render in the grid). Skips

@@ -101,12 +101,24 @@ columnview.data-table > header > button {
   border-bottom: 1px solid @borders;
 }
 
-/* SQL editor pane */
-.sql-editor {
-  border-bottom: 1px solid @borders;
-}
-
+/* SQL editor / notebook cells */
 .sql-editor textview {
   font-family: monospace;
   background-color: @view_bg_color;
+}
+
+.sql-cell {
+  border: 1px solid @borders;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: @view_bg_color;
+}
+
+.cell-toolbar {
+  padding: 6px 8px;
+  border-bottom: 1px solid @borders;
+}
+
+.cell-result {
+  border-top: 1px solid @borders;
 }

@@ -73,12 +73,14 @@ fn main() {
                 view,
                 move || {
                     let sql = view.open_sql_editor();
-                    sql.set_sql(
-                        "SELECT o.id, c.name, o.status, o.total, o.note\n\
-                         FROM orders o JOIN customers c ON c.id = o.customer_id\n\
-                         ORDER BY o.id",
-                    );
-                    sql.run_statement();
+                    if let Some(cell) = sql.first_cell() {
+                        cell.set_sql(
+                            "SELECT o.id, c.name, o.status, o.total, o.note\n\
+                             FROM orders o JOIN customers c ON c.id = o.customer_id\n\
+                             ORDER BY o.id",
+                        );
+                        cell.run();
+                    }
                 }
             ),
         );
