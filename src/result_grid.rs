@@ -24,6 +24,8 @@ const MAX_COL_WIDTH: i32 = 420;
 pub type SortFn = Rc<dyn Fn(usize)>;
 /// Cell double-click handler: (row, column index, column name, cell widget).
 pub type EditFn = Rc<dyn Fn(RowObject, usize, String, gtk::Widget)>;
+/// Cell right-click handler: (row, column index, cell widget).
+pub type ContextFn = Rc<dyn Fn(RowObject, usize, gtk::Widget)>;
 
 /// Per-render behavior knobs. Defaults yield a fully read-only grid.
 #[derive(Default)]
@@ -38,6 +40,8 @@ pub struct GridOpts {
     pub on_sort: Option<SortFn>,
     /// Cell double-click handler; `None` makes cells read-only.
     pub on_edit: Option<EditFn>,
+    /// Cell right-click handler; `None` disables the context menu.
+    pub on_context: Option<ContextFn>,
 }
 
 mod imp {
@@ -195,7 +199,8 @@ impl ResultGrid {
 
             // Edit non-badge cells in place when editing is enabled.
             let edit_cb = if opts.editable && !badge { opts.on_edit.clone() } else { None };
-            let factory = data_factory(idx, &column.name, numeric, badge, is_pk, edit_cb);
+            let factory =
+                data_factory(idx, &column.name, numeric, badge, is_pk, edit_cb, opts.on_context.clone());
             let col = gtk::ColumnViewColumn::new(None, Some(factory));
             col.set_fixed_width(width);
             col.set_resizable(false);
@@ -268,6 +273,7 @@ fn data_factory(
     badge: bool,
     is_pk: bool,
     on_edit: Option<EditFn>,
+    on_context: Option<ContextFn>,
 ) -> gtk::SignalListItemFactory {
     let factory = data_factory_inner(idx, numeric, badge, is_pk);
     if let Some(cb) = on_edit {
@@ -288,6 +294,24 @@ fn data_factory(
                     return;
                 };
                 cb(row, idx, col.clone(), anchor.clone());
+            });
+            child.add_controller(gesture);
+        });
+    }
+    if let Some(cb) = on_context {
+        // Third setup pass: a secondary-click (right-click) handler.
+        factory.connect_setup(move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap().clone();
+            let Some(child) = item.child() else { return };
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+            let cb = cb.clone();
+            let anchor = child.clone();
+            gesture.connect_pressed(move |_, _, _, _| {
+                let Some(row) = item.item().and_downcast::<RowObject>() else {
+                    return;
+                };
+                cb(row, idx, anchor.clone());
             });
             child.add_controller(gesture);
         });

@@ -16,7 +16,7 @@ use gtk::glib;
 use lsp_types::Diagnostic;
 use sourceview5::prelude::*;
 
-use crate::completion::LspCompletionProvider;
+use crate::completion::{LspCompletionProvider, LspHoverProvider};
 use crate::db::Connection;
 use crate::lsp::{self, LspClient};
 use crate::result_grid::{GridOpts, ResultGrid};
@@ -232,10 +232,15 @@ mod cell_imp {
                 buffer.set_language(Some(&lang));
             }
             buffer.set_highlight_syntax(true);
-            let schemes = sourceview5::StyleSchemeManager::default();
-            if let Some(scheme) = schemes.scheme("Adwaita").or_else(|| schemes.scheme("classic")) {
-                buffer.set_style_scheme(Some(&scheme));
-            }
+            // Match the source style scheme to the light/dark color scheme, and
+            // keep it in sync when the system preference flips.
+            let style_mgr = adw::StyleManager::default();
+            apply_style_scheme(&buffer, style_mgr.is_dark());
+            style_mgr.connect_dark_notify(glib::clone!(
+                #[weak]
+                buffer,
+                move |mgr| apply_style_scheme(&buffer, mgr.is_dark())
+            ));
 
             let view = sourceview5::View::with_buffer(&buffer);
             view.set_monospace(true);
@@ -366,6 +371,15 @@ impl SqlCell {
                 LspCompletionProvider::new(client.clone(), &uri, buffer, version.clone());
             view.completion().add_provider(&provider);
 
+            // Hover: type info from the language server.
+            view.hover().add_provider(&LspHoverProvider::new(client.clone(), &uri));
+
+            // Diagnostics gutter: show an error marker on flagged lines.
+            view.set_show_line_marks(true);
+            let attrs = sourceview5::MarkAttributes::new();
+            attrs.set_icon_name("dialog-error-symbolic");
+            view.set_mark_attributes("lsp-error", &attrs, 0);
+
             // Keep the server's copy in sync (debounced) so completion and
             // diagnostics reflect the latest text.
             let this = self.clone();
@@ -420,12 +434,17 @@ impl SqlCell {
 
         let (start, end) = buffer.bounds();
         buffer.remove_tag(&tag, &start, &end);
+        buffer.remove_source_marks(&start, &end, Some("lsp-error"));
 
         for d in diags {
             let a = buffer.iter_at_line_offset(d.range.start.line as i32, d.range.start.character as i32);
             let b = buffer.iter_at_line_offset(d.range.end.line as i32, d.range.end.character as i32);
             if let (Some(a), Some(b)) = (a, b) {
                 buffer.apply_tag(&tag, &a, &b);
+            }
+            // A gutter marker at the start of the diagnostic's line.
+            if let Some(line) = buffer.iter_at_line(d.range.start.line as i32) {
+                buffer.create_source_mark(None, "lsp-error", &line);
             }
         }
 
@@ -571,6 +590,20 @@ impl SqlCell {
         }
         self.show_result("error");
         self.set_status("error");
+    }
+}
+
+/// Apply the appropriate GtkSourceView style scheme for the active light/dark
+/// color scheme (falling back to whatever's available).
+fn apply_style_scheme(buffer: &sourceview5::Buffer, dark: bool) {
+    let schemes = sourceview5::StyleSchemeManager::default();
+    let name = if dark { "Adwaita-dark" } else { "Adwaita" };
+    if let Some(scheme) = schemes
+        .scheme(name)
+        .or_else(|| schemes.scheme("Adwaita"))
+        .or_else(|| schemes.scheme("classic"))
+    {
+        buffer.set_style_scheme(Some(&scheme));
     }
 }
 

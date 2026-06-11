@@ -13,8 +13,9 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|_| {
-        // The mockup is a light design; force it regardless of system theme.
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
+        // Follow the system light/dark preference (our CSS uses named adw
+        // colors, which adapt to the active scheme).
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
         load_css();
     });
     app.connect_activate(build_ui);

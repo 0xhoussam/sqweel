@@ -191,6 +191,36 @@ impl LspClient {
             None => Vec::new(),
         })
     }
+
+    /// Request hover info at a position; `None` when there's nothing to show.
+    pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Option<String> {
+        let resp: Option<lsp_types::Hover> = self
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character}
+                }),
+            )
+            .await
+            .ok()?;
+        let text = hover_to_string(resp?.contents);
+        (!text.trim().is_empty()).then_some(text)
+    }
+}
+
+/// Flatten LSP hover contents to plain text.
+fn hover_to_string(contents: lsp_types::HoverContents) -> String {
+    use lsp_types::{HoverContents, MarkedString};
+    let marked = |m: MarkedString| match m {
+        MarkedString::String(s) => s,
+        MarkedString::LanguageString(ls) => ls.value,
+    };
+    match contents {
+        HoverContents::Scalar(m) => marked(m),
+        HoverContents::Array(v) => v.into_iter().map(marked).collect::<Vec<_>>().join("\n"),
+        HoverContents::Markup(mc) => mc.value,
+    }
 }
 
 /// Route one incoming message to the matching request or the diagnostics channel.

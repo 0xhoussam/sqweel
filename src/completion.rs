@@ -237,6 +237,86 @@ impl LspCompletionProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hover provider
+// ---------------------------------------------------------------------------
+
+mod hover_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct LspHoverProvider {
+        pub client: RefCell<Option<LspClient>>,
+        pub uri: RefCell<String>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for LspHoverProvider {
+        const NAME: &'static str = "SqweelLspHoverProvider";
+        type Type = super::LspHoverProvider;
+        type Interfaces = (sourceview5::HoverProvider,);
+    }
+
+    impl ObjectImpl for LspHoverProvider {}
+
+    impl HoverProviderImpl for LspHoverProvider {
+        fn populate_future(
+            &self,
+            context: &sourceview5::HoverContext,
+            display: &sourceview5::HoverDisplay,
+        ) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+            let client = self.client.borrow().clone();
+            let uri = self.uri.borrow().clone();
+            let display = display.clone();
+            // Position of the hovered word.
+            let pos = context.bounds().map(|(start, _)| {
+                (start.line() as u32, start.line_offset() as u32)
+            });
+
+            Box::pin(async move {
+                let none = || Err(glib::Error::new(glib::FileError::Noent, "no hover"));
+                let (Some(client), Some((line, character))) = (client, pos) else {
+                    return none();
+                };
+                let rx =
+                    runtime::spawn(async move { client.hover(&uri, line, character).await });
+                match rx.recv().await {
+                    Ok(Some(text)) => {
+                        let label = gtk::Label::builder()
+                            .label(text)
+                            .selectable(true)
+                            .wrap(true)
+                            .xalign(0.0)
+                            .margin_top(6)
+                            .margin_bottom(6)
+                            .margin_start(8)
+                            .margin_end(8)
+                            .build();
+                        label.add_css_class("monospace");
+                        display.append(&label);
+                        Ok(())
+                    }
+                    _ => none(),
+                }
+            })
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct LspHoverProvider(ObjectSubclass<hover_imp::LspHoverProvider>)
+        @implements sourceview5::HoverProvider;
+}
+
+impl LspHoverProvider {
+    pub fn new(client: LspClient, uri: &str) -> Self {
+        let obj: Self = glib::Object::new();
+        obj.imp().client.replace(Some(client));
+        obj.imp().uri.replace(uri.to_string());
+        obj
+    }
+}
+
 /// A symbolic icon name for a completion item kind (tables, columns, keywords…).
 fn kind_icon(kind: Option<lsp_types::CompletionItemKind>) -> &'static str {
     use lsp_types::CompletionItemKind as K;

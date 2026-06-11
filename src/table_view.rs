@@ -7,7 +7,7 @@ use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
 use crate::db::{ColumnInfo, Connection, IndexInfo, RelationKind, ResultSet, Value};
-use crate::result_grid::{GridOpts, ResultGrid};
+use crate::result_grid::{ContextFn, GridOpts, ResultGrid};
 use crate::row_object::RowObject;
 use crate::runtime;
 
@@ -396,6 +396,14 @@ impl TableView {
                 }
             })
         };
+        let on_context: ContextFn = {
+            let weak = self.downgrade();
+            Rc::new(move |row, idx, anchor| {
+                if let Some(this) = weak.upgrade() {
+                    this.show_row_menu(&row, idx, &anchor);
+                }
+            })
+        };
 
         imp.result_grid.set_result(
             result,
@@ -405,6 +413,7 @@ impl TableView {
                 editable,
                 on_sort: Some(on_sort),
                 on_edit: Some(on_edit),
+                on_context: Some(on_context),
             },
         );
         drop(guard);
@@ -602,6 +611,160 @@ impl TableView {
 
         popover.popup();
         entry.grab_focus();
+    }
+
+    /// Right-click menu for a cell: view the full value, copy it, or delete the
+    /// row (when the table has a primary key).
+    fn show_row_menu(&self, row: &RowObject, idx: usize, anchor: &gtk::Widget) {
+        let has_pk = !self.imp().pk_cols.borrow().is_empty();
+
+        let bx = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = gtk::Popover::new();
+        popover.set_parent(anchor);
+        popover.set_autohide(true);
+        popover.set_child(Some(&bx));
+        popover.connect_closed(|p| p.unparent());
+
+        let menu_button = |label: &str| {
+            let b = gtk::Button::with_label(label);
+            b.add_css_class("flat");
+            if let Some(child) = b.child().and_downcast::<gtk::Label>() {
+                child.set_xalign(0.0);
+            }
+            b
+        };
+
+        let view_btn = menu_button("View value");
+        view_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[strong]
+            popover,
+            #[strong(rename_to = row)]
+            row,
+            #[strong(rename_to = anchor)]
+            anchor,
+            move |_| {
+                popover.popdown();
+                this.show_value_detail(&row, idx, &anchor);
+            }
+        ));
+        bx.append(&view_btn);
+
+        let copy_btn = menu_button("Copy value");
+        copy_btn.connect_clicked(glib::clone!(
+            #[strong]
+            popover,
+            #[strong(rename_to = row)]
+            row,
+            #[strong(rename_to = anchor)]
+            anchor,
+            move |_| {
+                anchor.clipboard().set_text(&row.display(idx));
+                popover.popdown();
+            }
+        ));
+        bx.append(&copy_btn);
+
+        if has_pk {
+            bx.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let delete_btn = menu_button("Delete row");
+            delete_btn.add_css_class("destructive-action");
+            delete_btn.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[strong]
+                popover,
+                #[strong(rename_to = row)]
+                row,
+                move |_| {
+                    popover.popdown();
+                    this.confirm_delete(&row);
+                }
+            ));
+            bx.append(&delete_btn);
+        }
+
+        popover.popup();
+    }
+
+    /// Show a cell's full value in a popover (pretty-printed if it's JSON).
+    fn show_value_detail(&self, row: &RowObject, idx: usize, anchor: &gtk::Widget) {
+        let raw = row.display(idx);
+        let text = pretty_json(&raw).unwrap_or(raw);
+
+        let view = gtk::TextView::new();
+        view.set_editable(false);
+        view.set_monospace(true);
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+        view.set_left_margin(8);
+        view.set_right_margin(8);
+        view.set_top_margin(8);
+        view.set_bottom_margin(8);
+        view.buffer().set_text(&text);
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .min_content_width(360)
+            .min_content_height(160)
+            .max_content_width(640)
+            .max_content_height(420)
+            .propagate_natural_width(true)
+            .propagate_natural_height(true)
+            .child(&view)
+            .build();
+
+        let popover = gtk::Popover::new();
+        popover.set_parent(anchor);
+        popover.set_child(Some(&scroll));
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
+    /// Confirm and delete the row identified by its primary key.
+    fn confirm_delete(&self, row: &RowObject) {
+        let pk = self.pk_pairs(row);
+        if pk.is_empty() {
+            return;
+        }
+        let schema = self.schema();
+        let table = self.table();
+        let descr = pk
+            .iter()
+            .map(|(c, v)| format!("{c} = {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let root = self.root().and_downcast::<gtk::Window>();
+        let dialog = adw::MessageDialog::new(
+            root.as_ref(),
+            Some("Delete row?"),
+            Some(&format!("This permanently deletes the row where {descr}.")),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let this = self.clone();
+        dialog.connect_response(None, move |dialog, resp| {
+            if resp != "delete" {
+                return;
+            }
+            let sql = build_delete(&schema, &table, &pk);
+            let conn = this.conn();
+            let rx = runtime::spawn(async move { conn.execute(&sql).await });
+            let this = this.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(_)) => this.reload(),
+                    Ok(Err(e)) => this.imp().summary.set_text(&format!("delete failed: {e}")),
+                    Err(_) => {}
+                }
+            });
+            dialog.close();
+        });
+        dialog.present();
     }
 
     fn sort_by(&self, idx: usize) {
@@ -1150,6 +1313,27 @@ fn build_update(
     )
 }
 
+/// Build a DELETE for the row identified by its primary key.
+fn build_delete(schema: &str, table: &str, pk: &[(String, String)]) -> String {
+    let cond = pk
+        .iter()
+        .map(|(c, v)| format!("\"{}\" = '{}'", quote_ident(c), v.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "DELETE FROM \"{}\".\"{}\" WHERE {}",
+        quote_ident(schema),
+        quote_ident(table),
+        cond
+    )
+}
+
+/// Pretty-print `s` if it parses as JSON, else `None`.
+fn pretty_json(s: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(s).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
 /// Escape LIKE metacharacters so the term matches literally.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1258,6 +1442,24 @@ mod tests {
             q,
             "UPDATE \"s\".\"t\" SET \"note\" = NULL WHERE \"a\" = '1' AND \"b\" = 'x''y'"
         );
+    }
+
+    #[test]
+    fn delete_targets_composite_pk() {
+        let pk = [
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "x'y".to_string()),
+        ];
+        assert_eq!(
+            super::build_delete("public", "orders", &pk),
+            "DELETE FROM \"public\".\"orders\" WHERE \"a\" = '1' AND \"b\" = 'x''y'"
+        );
+    }
+
+    #[test]
+    fn pretty_json_only_for_json() {
+        assert!(super::pretty_json("not json").is_none());
+        assert_eq!(super::pretty_json("{\"a\":1}").unwrap(), "{\n  \"a\": 1\n}");
     }
 
     #[test]
