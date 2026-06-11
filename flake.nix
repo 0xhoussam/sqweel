@@ -80,6 +80,9 @@
 
               # libdbus for keyring (secret service)
               dbus
+
+              # SQL language server (LSP backend for the editor)
+              sqls
             ];
 
             env = {

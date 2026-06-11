@@ -122,3 +122,16 @@ columnview.data-table > header > button {
 .cell-result {
   border-top: 1px solid @borders;
 }
+
+/* SQL completion popup (GtkSourceView) */
+GtkSourceAssistant.completion {
+  border: 1px solid @borders;
+  border-radius: 8px;
+  padding: 4px;
+  background-color: @popover_bg_color;
+}
+
+GtkSourceCompletionListBoxRow {
+  padding: 4px 8px;
+  border-radius: 5px;
+}

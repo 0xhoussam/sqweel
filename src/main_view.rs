@@ -6,6 +6,7 @@ use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
 use crate::db::{Connection, ConnectionConfig, DbError, Relation, RelationKind};
+use crate::lsp::LspClient;
 use crate::runtime;
 use crate::sql_view::SqlView;
 use crate::table_view::TableView;
@@ -44,6 +45,7 @@ mod imp {
         pub current_schema: RefCell<String>,
         pub row_meta: RefCell<Vec<RowMeta>>,
         pub search_text: RefCell<String>,
+        pub lsp: RefCell<Option<LspClient>>,
     }
 
     #[glib::object_subclass]
@@ -140,7 +142,38 @@ impl MainView {
         imp.connection_host.set_text(&format!("{}:{}", cfg.host, cfg.port));
         obj.set_title(&cfg.database);
         obj.load_metadata();
+        obj.start_lsp(cfg);
         obj
+    }
+
+    /// Spawn the SQL language server for this connection in the background.
+    /// Failure is non-fatal — the editor simply runs without completion.
+    fn start_lsp(&self, cfg: &ConnectionConfig) {
+        let cfg = cfg.clone();
+        let rx = runtime::spawn(async move { LspClient::start(&cfg).await });
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Ok((client, diags))) = rx.recv().await {
+                this.imp().lsp.replace(Some(client));
+
+                // Fan diagnostics out to whichever open SQL editor owns the URI.
+                let this = this.clone();
+                glib::spawn_future_local(async move {
+                    while let Ok(params) = diags.recv().await {
+                        let uri = params.uri.to_string();
+                        let pages = this.imp().tab_view.pages();
+                        for i in 0..pages.n_items() {
+                            let Some(page) = pages.item(i).and_downcast::<adw::TabPage>() else {
+                                continue;
+                            };
+                            if let Some(sv) = page.child().downcast_ref::<SqlView>() {
+                                sv.apply_diagnostics(&uri, &params.diagnostics);
+                            }
+                        }
+                    }
+                });
+            }
+        });
     }
 
     fn conn(&self) -> Arc<dyn Connection> {
@@ -320,7 +353,7 @@ impl MainView {
     pub fn open_sql_editor(&self) -> SqlView {
         let imp = self.imp();
         let schema = imp.current_schema.borrow().clone();
-        let sv = SqlView::new(self.conn(), &schema);
+        let sv = SqlView::new(self.conn(), &schema, imp.lsp.borrow().clone());
         let page = imp.tab_view.append(&sv);
         page.set_title("SQL");
         page.set_icon(Some(&gio::ThemedIcon::new("utilities-terminal-symbolic")));

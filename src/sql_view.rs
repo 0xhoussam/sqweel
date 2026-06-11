@@ -8,13 +8,17 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
+use lsp_types::Diagnostic;
 use sourceview5::prelude::*;
 
+use crate::completion::LspCompletionProvider;
 use crate::db::Connection;
+use crate::lsp::{self, LspClient};
 use crate::result_grid::{GridOpts, ResultGrid};
 use crate::runtime;
 
@@ -34,6 +38,8 @@ mod imp {
         pub conn: RefCell<Option<Arc<dyn Connection>>>,
         pub schema: RefCell<String>,
         pub cells: RefCell<Vec<super::SqlCell>>,
+        pub lsp: RefCell<Option<LspClient>>,
+        pub next_doc_id: Cell<u64>,
     }
 
     #[glib::object_subclass]
@@ -65,11 +71,12 @@ glib::wrapper! {
 
 #[gtk::template_callbacks]
 impl SqlView {
-    pub fn new(conn: Arc<dyn Connection>, schema: &str) -> Self {
+    pub fn new(conn: Arc<dyn Connection>, schema: &str, lsp: Option<LspClient>) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.conn.replace(Some(conn));
         imp.schema.replace(schema.to_string());
+        imp.lsp.replace(lsp);
         obj.add_cell();
         obj
     }
@@ -85,7 +92,9 @@ impl SqlView {
     /// Append a new empty cell and focus its editor; returns it.
     pub fn add_cell(&self) -> SqlCell {
         let imp = self.imp();
-        let cell = SqlCell::new(self.conn(), &self.schema());
+        let doc_id = imp.next_doc_id.get();
+        imp.next_doc_id.set(doc_id + 1);
+        let cell = SqlCell::new(self.conn(), &self.schema(), imp.lsp.borrow().clone(), doc_id);
         imp.cells_box.append(&cell);
 
         // Wire the cell's Delete button to remove it from the notebook.
@@ -93,6 +102,7 @@ impl SqlView {
         let cell_weak = cell.downgrade();
         cell.set_on_delete(move || {
             if let (Some(this), Some(cell)) = (weak.upgrade(), cell_weak.upgrade()) {
+                cell.close_lsp();
                 this.imp().cells_box.remove(&cell);
                 this.imp().cells.borrow_mut().retain(|c| c != &cell);
                 // Keep at least one cell around to type into.
@@ -110,6 +120,16 @@ impl SqlView {
     /// The first cell, if any (used by smoke tests).
     pub fn first_cell(&self) -> Option<SqlCell> {
         self.imp().cells.borrow().first().cloned()
+    }
+
+    /// Route diagnostics for `uri` to the matching cell.
+    pub(crate) fn apply_diagnostics(&self, uri: &str, diags: &[Diagnostic]) {
+        for cell in self.imp().cells.borrow().iter() {
+            if cell.uri() == uri {
+                cell.apply_diagnostics(diags);
+                break;
+            }
+        }
     }
 
     #[template_callback]
@@ -140,6 +160,11 @@ mod cell_imp {
         pub error_label: RefCell<Option<gtk::Label>>,
         pub on_delete: RefCell<Option<Rc<dyn Fn()>>>,
         pub running: Cell<bool>,
+        // LSP wiring (None when no language server is available).
+        pub lsp: RefCell<Option<LspClient>>,
+        pub uri: RefCell<String>,
+        pub version: RefCell<Option<Arc<AtomicI64>>>,
+        pub change_source: RefCell<Option<glib::SourceId>>,
     }
 
     #[glib::object_subclass]
@@ -311,12 +336,116 @@ glib::wrapper! {
 }
 
 impl SqlCell {
-    fn new(conn: Arc<dyn Connection>, schema: &str) -> Self {
+    fn new(
+        conn: Arc<dyn Connection>,
+        schema: &str,
+        lsp: Option<LspClient>,
+        doc_id: u64,
+    ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.conn.replace(Some(conn));
         imp.schema.replace(schema.to_string());
+        obj.setup_lsp(lsp, doc_id);
         obj
+    }
+
+    /// Open this cell's document with the language server and attach the
+    /// completion provider. No-op when there's no server.
+    fn setup_lsp(&self, lsp: Option<LspClient>, doc_id: u64) {
+        let Some(client) = lsp else { return };
+        let imp = self.imp();
+        let uri = lsp::cell_uri(doc_id);
+        client.did_open(&uri, "");
+        let version = Arc::new(AtomicI64::new(1));
+
+        if let (Some(view), Some(buffer)) =
+            (imp.view.borrow().as_ref(), imp.buffer.borrow().as_ref())
+        {
+            let provider =
+                LspCompletionProvider::new(client.clone(), &uri, buffer, version.clone());
+            view.completion().add_provider(&provider);
+
+            // Keep the server's copy in sync (debounced) so completion and
+            // diagnostics reflect the latest text.
+            let this = self.clone();
+            buffer.connect_changed(move |_| this.schedule_did_change());
+        }
+
+        imp.lsp.replace(Some(client));
+        imp.uri.replace(uri);
+        imp.version.replace(Some(version));
+    }
+
+    /// Debounce `didChange` notifications while typing.
+    fn schedule_did_change(&self) {
+        let imp = self.imp();
+        if let Some(id) = imp.change_source.take() {
+            id.remove();
+        }
+        let this = self.clone();
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+            this.imp().change_source.take();
+            this.send_did_change();
+        });
+        imp.change_source.replace(Some(id));
+    }
+
+    fn send_did_change(&self) {
+        let imp = self.imp();
+        let (Some(client), Some(version)) =
+            (imp.lsp.borrow().clone(), imp.version.borrow().clone())
+        else {
+            return;
+        };
+        let v = version.fetch_add(1, Ordering::SeqCst) + 1;
+        client.did_change(&imp.uri.borrow(), v, &self.sql_text());
+    }
+
+    /// This cell's LSP document URI ("" when no server).
+    pub(crate) fn uri(&self) -> String {
+        self.imp().uri.borrow().clone()
+    }
+
+    /// Underline diagnostic ranges and surface the first message in the status.
+    pub(crate) fn apply_diagnostics(&self, diags: &[Diagnostic]) {
+        let Some(buffer) = self.imp().buffer.borrow().clone() else { return };
+
+        let table = buffer.tag_table();
+        let tag = table.lookup("lsp-error").unwrap_or_else(|| {
+            buffer
+                .create_tag(Some("lsp-error"), &[("underline", &gtk::pango::Underline::Error)])
+                .expect("create lsp-error tag")
+        });
+
+        let (start, end) = buffer.bounds();
+        buffer.remove_tag(&tag, &start, &end);
+
+        for d in diags {
+            let a = buffer.iter_at_line_offset(d.range.start.line as i32, d.range.start.character as i32);
+            let b = buffer.iter_at_line_offset(d.range.end.line as i32, d.range.end.character as i32);
+            if let (Some(a), Some(b)) = (a, b) {
+                buffer.apply_tag(&tag, &a, &b);
+            }
+        }
+
+        match diags.first() {
+            Some(first) => {
+                self.set_status(&format!("⚠ {}", first.message.lines().next().unwrap_or("")))
+            }
+            None => self.set_status(""),
+        }
+    }
+
+    /// Tell the server the document is gone (called before the cell is removed).
+    pub(crate) fn close_lsp(&self) {
+        let imp = self.imp();
+        if let Some(client) = imp.lsp.borrow().clone() {
+            let uri = imp.uri.borrow().clone();
+            if !uri.is_empty() {
+                client.did_close(&uri);
+            }
+        }
     }
 
     fn conn(&self) -> Arc<dyn Connection> {
